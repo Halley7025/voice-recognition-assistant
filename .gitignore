@@ -1,0 +1,8 @@
+# 屏蔽整个模型文件夹（核心！）
+models/
+
+# 屏蔽Python缓存和临时文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

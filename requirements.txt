@@ -1,0 +1,11 @@
+pyaudio==0.2.14
+librosa==0.10.2.post1
+webrtcvad==2.0.10
+noisereduce==2.0.1
+faster-whisper==1.0.3
+pycaw==20240210
+screen-brightness-control==0.22.1
+pyautogui==0.9.54
+numpy==1.26.4
+scipy==1.13.0
+torch==2.3.0
