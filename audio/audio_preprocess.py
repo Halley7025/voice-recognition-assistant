@@ -45,8 +45,11 @@ class AudioPreprocessor:
         clean_stft = clean_mag * np.exp(1j * phase)
         return np.fft.irfft(clean_stft, n=len(audio))
 
-    def update_noise_estimate(self, audio):
-        stft = np.fft.rfft(audio)
+    def update_noise_estimate(self, audio, n_fft=None):
+        if n_fft is not None:
+            stft = np.fft.rfft(audio, n=n_fft)
+        else:
+            stft = np.fft.rfft(audio)
         magnitude = np.abs(stft)
         if self.noise_estimate is None:
             self.noise_estimate = magnitude
@@ -100,18 +103,37 @@ class AudioPreprocessor:
         audio = self.normalize(audio)
         audio = self.pre_emphasis(audio)
         if use_spectral_subtraction:
-            self.update_noise_estimate(audio[:self.frame_length * 3])
+            full_stft = np.fft.rfft(audio)
+            self.update_noise_estimate(audio[:self.frame_length * 3], n_fft=len(full_stft))
             audio = self.spectral_subtraction(audio)
         audio = self.remove_silence(audio)
         audio = self.normalize(audio)
         return audio
 
     def extract_mel_spectrogram(self, audio, n_mels=80):
-        import librosa
-        mel = librosa.feature.melspectrogram(
-            y=audio, sr=self.sample_rate, n_mels=n_mels,
-            n_fft=FFT_SIZE, hop_length=self.frame_shift,
-            win_length=self.frame_length
-        )
-        log_mel = librosa.power_to_db(mel, ref=np.max)
+        stft = np.abs(np.fft.rfft(
+            self.framing(audio) * np.hamming(self.frame_length),
+            n=FFT_SIZE, axis=1
+        ))  # shape: (n_frames, n_fft//2+1)
+        power = stft ** 2
+        mel_basis = self._mel_filterbank(n_mels, FFT_SIZE)
+        mel = np.dot(mel_basis, power.T)  # shape: (n_mels, n_frames)
+        log_mel = 10 * np.log10(np.maximum(mel, 1e-10))
+        log_mel = log_mel - np.max(log_mel)
         return log_mel
+
+    def _mel_filterbank(self, n_mels, n_fft):
+        def hz_to_mel(hz): return 2595 * np.log10(1 + hz / 700)
+        def mel_to_hz(mel): return 700 * (10 ** (mel / 2595) - 1)
+        low_mel = hz_to_mel(0)
+        high_mel = hz_to_mel(self.sample_rate / 2)
+        mel_points = np.linspace(low_mel, high_mel, n_mels + 2)
+        hz_points = mel_to_hz(mel_points)
+        bin = np.floor((n_fft + 1) * hz_points / self.sample_rate).astype(int)
+        fbank = np.zeros((n_mels, n_fft // 2 + 1))
+        for m in range(n_mels):
+            for k in range(bin[m], bin[m + 1]):
+                fbank[m, k] = (k - bin[m]) / (bin[m + 1] - bin[m] + 1e-10)
+            for k in range(bin[m + 1], bin[m + 2]):
+                fbank[m, k] = (bin[m + 2] - k) / (bin[m + 2] - bin[m + 1] + 1e-10)
+        return fbank

@@ -158,7 +158,11 @@ KEYWORD_INTENT_MAP = {
 INTENT_LABELS = [
     "open_notepad", "open_browser", "volume_up", "volume_down",
     "open_calculator", "open_explorer", "screenshot", "lock_screen",
-    "close_window", "open_task_manager", "open_settings", "open_cmd", "unknown"
+    "close_window", "open_task_manager", "open_settings", "open_cmd",
+    "open_paint", "open_word", "open_excel", "open_ppt",
+    "open_wechat", "open_qq", "mute", "unmute",
+    "maximize_window", "minimize_window", "open_taskbar",
+    "new_folder", "empty_recycle", "unknown"
 ]
 
 INTENT_TRAIN_DATA = [
@@ -178,8 +182,16 @@ INTENT_TRAIN_DATA = [
     ("打开任务管理器", "open_task_manager"), ("查看任务管理器", "open_task_manager"),
     ("打开设置", "open_settings"), ("系统设置", "open_settings"), ("打开命令行", "open_cmd"),
     ("打开终端", "open_cmd"), ("打开cmd", "open_cmd"),
-]
 
+    ("打开画图", "open_paint"), ("画图工具", "open_paint"), ("打开Word", "open_word"),
+    ("打开文档", "open_word"), ("打开Excel", "open_excel"), ("打开表格", "open_excel"),
+    ("打开PPT", "open_ppt"), ("打开演示", "open_ppt"), ("打开微信", "open_wechat"),
+    ("启动微信", "open_wechat"), ("打开QQ", "open_qq"), ("启动QQ", "open_qq"),
+    ("静音", "mute"), ("取消静音", "unmute"), ("最大化窗口", "maximize_window"),
+    ("最小化窗口", "minimize_window"), ("切换窗口", "open_taskbar"),
+    ("新建文件夹", "new_folder"), ("清空回收站", "empty_recycle"),
+    ("今天天气怎么样", "unknown"), ("播放音乐", "unknown"), ("你好", "unknown"),
+]
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 SPEAKER_DB_DIR = os.path.join(os.path.dirname(__file__), "speaker_db")

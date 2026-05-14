@@ -12,6 +12,7 @@ class SpeakerVerifier:
         self.threshold = SPEAKER_SIMILARITY_THRESHOLD
         self.enroll_samples_required = SPEAKER_ENROLL_SAMPLES
         self._load_model()
+        self._load_db()
 
     def _load_model(self):
         os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
@@ -51,6 +52,10 @@ class SpeakerVerifier:
         model_path = os.path.join(snapshots, snap_dirs[0])
         if not os.path.exists(os.path.join(model_path, "hyperparams.yaml")):
             return False
+        lt = os.path.join(model_path, "label_encoder.txt")
+        lc = os.path.join(model_path, "label_encoder.ckpt")
+        if os.path.exists(lt) and not os.path.exists(lc):
+            import shutil; shutil.copy2(lt, lc)
         return self._init_speechbrain(model_path)
 
     def _try_load_from_local(self, local_dir):
@@ -136,8 +141,9 @@ class SpeakerVerifier:
         for t in thresholds:
             far = np.mean(impostor_scores >= t)
             frr = np.mean(genuine_scores < t)
-            if abs(far - frr) < abs(min_eer - 0):
-                min_eer = (far + frr) / 2
+            eer = (far + frr) / 2
+            if eer < min_eer:
+                min_eer = eer
                 best_threshold = t
         return min_eer, best_threshold
 
