@@ -22,6 +22,8 @@ from asr.speech_recognizer import SpeechRecognizer
 from speaker.speaker_verifier import SpeakerVerifier
 from controller.command_parser import CommandParser
 from controller.system_controller import SystemController
+from controller.speech_feedback import SpeechFeedback
+from controller.command_history import CommandHistory
 from global_config import SAMPLE_RATE
 
 
@@ -247,6 +249,8 @@ class MainWindow(QMainWindow):
         self.verifier._load_db()
         self.parser = CommandParser(use_nlu=False)
         self.controller = SystemController()
+        self.tts = SpeechFeedback(enabled=False)
+        self.history = CommandHistory()
         self.recognize_thread = None
         self.current_user = None
         self.command_history = deque(maxlen=100)
@@ -395,21 +399,53 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
         layout.setContentsMargins(8, 0, 0, 0)
 
-        log_group = QGroupBox("执行日志")
-        log_layout = QVBoxLayout(log_group)
+        right_tabs = QTabWidget()
 
+        log_tab = QWidget()
+        log_layout = QVBoxLayout(log_tab)
         self.log_display = QTextEdit()
         self.log_display.setReadOnly(True)
         self.log_display.setFont(QFont("Consolas", 10))
         log_layout.addWidget(self.log_display)
-
         clear_btn = QPushButton("清空日志")
         clear_btn.setFixedHeight(30)
         clear_btn.setCursor(Qt.PointingHandCursor)
         clear_btn.clicked.connect(self.log_display.clear)
         log_layout.addWidget(clear_btn)
+        right_tabs.addTab(log_tab, "执行日志")
 
-        layout.addWidget(log_group)
+        history_tab = QWidget()
+        hist_layout = QVBoxLayout(history_tab)
+        self.history_display = QTextEdit()
+        self.history_display.setReadOnly(True)
+        self.history_display.setFont(QFont("Consolas", 10))
+        hist_layout.addWidget(self.history_display)
+        hist_btn_row = QHBoxLayout()
+        refresh_hist_btn = QPushButton("刷新")
+        refresh_hist_btn.setFixedHeight(30)
+        refresh_hist_btn.setCursor(Qt.PointingHandCursor)
+        refresh_hist_btn.clicked.connect(self._refresh_history)
+        hist_btn_row.addWidget(refresh_hist_btn)
+        clear_hist_btn = QPushButton("清空历史")
+        clear_hist_btn.setFixedHeight(30)
+        clear_hist_btn.setCursor(Qt.PointingHandCursor)
+        clear_hist_btn.clicked.connect(self._clear_history)
+        hist_btn_row.addWidget(clear_hist_btn)
+        hist_layout.addLayout(hist_btn_row)
+        right_tabs.addTab(history_tab, "指令历史")
+
+        settings_tab = QWidget()
+        settings_layout = QVBoxLayout(settings_tab)
+
+        tts_group = QGroupBox("语音反馈")
+        tts_layout = QVBoxLayout(tts_group)
+        self.tts_toggle = QPushButton("语音反馈: 关闭")
+        self.tts_toggle.setCheckable(True)
+        self.tts_toggle.setFixedHeight(36)
+        self.tts_toggle.setCursor(Qt.PointingHandCursor)
+        self.tts_toggle.clicked.connect(self._toggle_tts)
+        tts_layout.addWidget(self.tts_toggle)
+        settings_layout.addWidget(tts_group)
 
         info_group = QGroupBox("系统信息")
         info_layout = QVBoxLayout(info_group)
@@ -419,8 +455,24 @@ class MainWindow(QMainWindow):
         self.info_label.setTextFormat(Qt.RichText)
         self._update_info_display()
         info_layout.addWidget(self.info_label)
-        layout.addWidget(info_group)
+        settings_layout.addWidget(info_group)
 
+        hotkey_group = QGroupBox("快捷键")
+        hotkey_layout = QVBoxLayout(hotkey_group)
+        hotkey_info = QLabel(
+            "<b>F2</b> — 开始/停止语音识别<br>"
+            "<b>Enter</b> — 执行手动输入指令<br>"
+            "<b>Ctrl+Q</b> — 退出程序"
+        )
+        hotkey_info.setTextFormat(Qt.RichText)
+        hotkey_layout.addWidget(hotkey_info)
+        settings_layout.addWidget(hotkey_group)
+
+        settings_layout.addStretch()
+        right_tabs.addTab(settings_tab, "设置")
+
+        layout.addWidget(right_tabs)
+        self._refresh_history()
         return panel
 
     def _create_footer(self):
@@ -547,7 +599,9 @@ class MainWindow(QMainWindow):
     def _update_info_display(self):
         users = self.verifier.list_users()
         user_count = len(users)
-        cmd_count = len(self.command_history)
+        stats = self.history.get_stats()
+        cmd_count = stats["total"]
+        most_used = stats.get("most_used", "无")
         model_name = self.recognizer.model_type or "未加载"
         info_html = f"""
         <div style='color: {COLORS["text_secondary"]}; line-height: 1.8;'>
@@ -555,14 +609,55 @@ class MainWindow(QMainWindow):
         识别: Whisper ({model_name})<br>
         声纹: ECAPA-TDNN<br>
         预处理: 谱减法 + 能量VAD<br>
-        控制: Windows API<br><br>
+        控制: Windows API ({len(self.controller.get_all_commands())}种指令)<br><br>
         <b style='color: {COLORS["text_primary"]}'>统计</b><br>
         已注册用户: {user_count}<br>
         已执行指令: {cmd_count}<br>
-        当前用户: {self.current_user or '未登录'}
+        最常用指令: {most_used}<br>
+        当前用户: {self.current_user or '未登录'}<br>
+        语音反馈: {'开启' if self.tts.enabled else '关闭'}
         </div>
         """
         self.info_label.setText(info_html)
+
+    def _toggle_tts(self):
+        self.tts.enabled = not self.tts.enabled
+        if self.tts.enabled:
+            self.tts_toggle.setText("语音反馈: 开启")
+            self.tts_toggle.setStyleSheet(f"background-color: {COLORS['success']};")
+            self.tts.speak("语音反馈已开启")
+        else:
+            self.tts_toggle.setText("语音反馈: 关闭")
+            self.tts_toggle.setStyleSheet("")
+        self._update_info_display()
+
+    def _refresh_history(self):
+        if not hasattr(self, 'history_display'):
+            return
+        entries = self.history.get_recent(30)
+        self.history_display.clear()
+        if not entries:
+            self.history_display.setPlainText("  暂无历史记录")
+            return
+        lines = []
+        for e in reversed(entries):
+            src = "语音" if e.get("source") == "voice" else "手动"
+            lines.append(
+                f"[{e['timestamp']}] ({src}) {e['text']} → {e.get('result', '')}"
+            )
+        self.history_display.setPlainText("\n".join(lines))
+
+    def _clear_history(self):
+        self.history.clear()
+        self._refresh_history()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_F2:
+            self._toggle_listening()
+        elif event.key() == Qt.Key_Q and event.modifiers() == Qt.ControlModifier:
+            self.close()
+        else:
+            super().keyPressEvent(event)
 
     def _refresh_user_list(self):
         self.user_combo.clear()
@@ -623,7 +718,8 @@ class MainWindow(QMainWindow):
                       f"'{text}' → "
                       f"<span style='color:{COLORS['success']}'>{result}</span> "
                       f"<span style='color:{COLORS['text_muted']}'>({elapsed:.2f}s)</span>")
-            self.command_history.append({"time": timestamp, "text": text, "result": result})
+            self.history.add(text, text, result, source="voice")
+            self.tts.speak(result)
         else:
             self._log(f"<span style='color:{COLORS['text_muted']}'>[{timestamp}]</span> "
                       f"<span style='color:{COLORS['warning']}'>{result}</span>")
@@ -643,7 +739,8 @@ class MainWindow(QMainWindow):
             self._log(f"<span style='color:{COLORS['text_muted']}'>[{timestamp}]</span> "
                       f"<span style='color:{COLORS['gradient_start']}'>手动:</span> "
                       f"'{text}' → <span style='color:{COLORS['success']}'>{result}</span>")
-            self.command_history.append({"time": timestamp, "text": text, "result": result})
+            self.history.add(text, cmd, result, source="manual")
+            self.tts.speak(result)
         else:
             self._log(f"<span style='color:{COLORS['text_muted']}'>[{timestamp}]</span> "
                       f"'{text}' → <span style='color:{COLORS['warning']}'>未匹配到指令</span>")
@@ -659,7 +756,8 @@ class MainWindow(QMainWindow):
         self._log(f"<span style='color:{COLORS['text_muted']}'>[{timestamp}]</span> "
                   f"<span style='color:{COLORS['gradient_start']}'>快捷:</span> "
                   f"{cmd} → <span style='color:{COLORS['success']}'>{result}</span>")
-        self.command_history.append({"time": timestamp, "text": cmd, "result": result})
+        self.history.add(cmd, cmd, result, source="quick")
+        self.tts.speak(result)
         self.status_indicator.set_status("success")
         QTimer.singleShot(1000, lambda: self.status_indicator.set_status("idle"))
         self._update_info_display()
