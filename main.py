@@ -1,7 +1,19 @@
 import sys
 import os
 import time
+
+if sys.platform == "win32":
+    torch_lib = os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib")
+    if os.path.isdir(torch_lib):
+        os.environ["PATH"] = torch_lib + ";" + os.environ.get("PATH", "")
+
 import numpy as np
+
+try:
+    import torch
+    _ = torch.zeros(1)
+except Exception:
+    pass
 
 sys.path.insert(0, os.path.dirname(__file__))
 from audio.audio_capture import AudioCapture

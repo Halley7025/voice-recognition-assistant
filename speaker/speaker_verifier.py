@@ -15,16 +15,29 @@ class SpeakerVerifier:
 
     def _load_model(self):
         try:
+            import os
+            os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
             from speechbrain.inference.speaker import EncoderClassifier
+            savedir = os.path.join(os.path.dirname(__file__), "..", "models", "ecapa_tdnn")
+            os.makedirs(savedir, exist_ok=True)
             self.model = EncoderClassifier.from_hparams(
                 source="speechbrain/spkrec-ecapa-voxceleb",
-                savedir=os.path.join(os.path.dirname(__file__), "..", "models", "ecapa_tdnn"),
+                savedir=savedir,
                 run_opts={"device": "cpu"}
             )
             print("ECAPA-TDNN声纹模型加载成功")
         except Exception as e:
             print(f"ECAPA-TDNN模型加载失败: {e}")
-            self.model = None
+            try:
+                from speechbrain.inference.speaker import EncoderClassifier
+                self.model = EncoderClassifier.from_hparams(
+                    source="speechbrain/spkrec-ecapa-voxceleb",
+                    run_opts={"device": "cpu"}
+                )
+                print("ECAPA-TDNN声纹模型加载成功 (使用默认缓存)")
+            except Exception as e2:
+                print(f"ECAPA-TDNN加载失败 (无网络): {e2}")
+                self.model = None
 
     def extract_embedding(self, audio_data):
         if self.model is None:

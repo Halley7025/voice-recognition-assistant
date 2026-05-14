@@ -1,6 +1,13 @@
 import os
+import sys
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+
+if sys.platform == "win32":
+    torch_lib = os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib")
+    if os.path.isdir(torch_lib):
+        os.environ["PATH"] = torch_lib + ";" + os.environ.get("PATH", "")
 
 SAMPLE_RATE = 16000
 CHANNELS = 1

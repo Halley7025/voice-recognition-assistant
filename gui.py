@@ -1,8 +1,21 @@
 import sys
 import os
 import time
+
+if sys.platform == "win32":
+    torch_lib = os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib")
+    if os.path.isdir(torch_lib):
+        os.environ["PATH"] = torch_lib + ";" + os.environ.get("PATH", "")
+
 import numpy as np
 from collections import deque
+
+try:
+    import torch
+    _ = torch.zeros(1)
+except Exception:
+    pass
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QTextEdit, QComboBox, QGroupBox,
