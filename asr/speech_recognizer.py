@@ -122,6 +122,8 @@ class SpeechRecognizer:
 
     @staticmethod
     def compute_cer(reference, hypothesis):
+        if not reference:
+            return 0.0
         ref_chars = list(reference)
         hyp_chars = list(hypothesis)
         n, m = len(ref_chars), len(hyp_chars)
