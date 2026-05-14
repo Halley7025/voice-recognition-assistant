@@ -153,6 +153,13 @@ KEYWORD_INTENT_MAP = {
     "切换": "open_taskbar",
     "文件夹": "new_folder",
     "回收站": "empty_recycle",
+    "新建": "new_folder",
+    "文件夹": "new_folder",
+    "静音": "mute",
+    "取消静音": "unmute",
+    "最大化": "maximize_window",
+    "最小化": "minimize_window",
+    "切换": "open_taskbar",
 }
 
 INTENT_LABELS = [

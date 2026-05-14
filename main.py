@@ -41,7 +41,6 @@ class VoiceAssistant:
 
         print("[4/6] 初始化声纹验证模块 (ECAPA-TDNN)...")
         self.verifier = SpeakerVerifier()
-        self.verifier._load_db()
 
         print("[5/6] 初始化指令解析器...")
         self.parser = CommandParser(use_nlu=False)
@@ -69,7 +68,7 @@ class VoiceAssistant:
             processed = self.preprocessor.process(raw)
             if len(processed) > SAMPLE_RATE * 0.5:
                 samples.append(processed)
-                print(f"采样 {i+1} 完成 (时长: {len(processed)/16000:.1f}s)")
+                print(f"采样 {i+1} 完成 (时长: {len(processed)/SAMPLE_RATE:.1f}s)")
             else:
                 print("采样无效，请重试")
                 i -= 1
@@ -159,9 +158,57 @@ class VoiceAssistant:
 
 
 def main():
+    if "--status" in sys.argv:
+        print_status()
+        return
+    if "--benchmark" in sys.argv:
+        from benchmark import benchmark_spectral_subtraction
+        benchmark_spectral_subtraction()
+        return
     assistant = VoiceAssistant()
     assistant.run_interactive()
 
+
+def print_status():
+    print("=" * 50)
+    print("语音识别助手 - 模型状态检查")
+    print("=" * 50)
+    import os
+
+    status = lambda x: "[OK]" if x else "[--]"
+        # Check Whisper model
+    base = os.path.join(os.path.dirname(__file__), "models", "base")
+    cache = os.path.expanduser("~/.cache/huggingface/hub/models--Systran--faster-whisper-base")
+    has_whisper = os.path.exists(os.path.join(base, "model.bin"))
+    has_faster = os.path.isdir(cache)
+    print(f"Whisper (OpenAI format): {status(has_whisper)} models/base/model.bin")
+    print(f"Whisper (CTranslate2):   {status(has_faster)} HF cache")
+
+    # Check ECAPA-TDNN
+    ecapa = os.path.join(os.path.dirname(__file__), "models", "ecapa_tdnn")
+    has_ecapa = os.path.exists(os.path.join(ecapa, "embedding_model.ckpt"))
+    print(f"ECAPA-TDNN:              {status(has_ecapa)} models/ecapa_tdnn/")
+
+    # Check speaker DB
+    db = os.path.join(os.path.dirname(__file__), "speaker_db", "speakers.json")
+    has_db = os.path.exists(db)
+    if has_db:
+        import json
+        with open(db, "r") as f:
+            users = json.load(f)
+        print(f"声纹数据库:              [OK] {len(users)} 个已注册用户")
+    else:
+        print("声纹数据库:              [--] 未初始化")
+
+    # Check Python packages
+    pkgs = ["torch", "faster_whisper", "speechbrain", "PyQt5", "pyttsx3"]
+    for pkg in pkgs:
+        try:
+            __import__(pkg)
+            print(f"{pkg:<25} [OK]")
+        except ImportError:
+            print(f"{pkg:<25} [--]")
+    print("=" * 50)
 
 if __name__ == "__main__":
     from global_config import SAMPLE_RATE

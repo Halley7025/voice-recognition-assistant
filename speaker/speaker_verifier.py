@@ -27,7 +27,7 @@ class SpeakerVerifier:
         strategies = [
             ("HF缓存", self._try_load_from_cache, (cache_dir,)),
             ("本地目录", self._try_load_from_local, (local_dir,)),
-            ("默认下载", self._try_load_default, ()),
+            # 离线模式下跳过默认下载策略
         ]
 
         for name, func, args in strategies:
@@ -69,8 +69,6 @@ class SpeakerVerifier:
             import shutil; shutil.copy2(lt,lc)
         return self._init_speechbrain(local_dir)
 
-    def _try_load_default(self):
-        return self._init_speechbrain(None)
 
     def _init_speechbrain(self, savedir):
         from speechbrain.inference.speaker import EncoderClassifier
