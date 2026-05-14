@@ -16,6 +16,7 @@ class SpeakerVerifier:
     def _load_model(self):
         os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
         os.environ["SPEECHBRAIN_STRATEGY"] = "copy"
+        os.environ["HF_HUB_OFFLINE"] = "1"
 
         cache_dir = os.path.expanduser(
             r"~\.cache\huggingface\hub\models--speechbrain--spkrec-ecapa-voxceleb"
@@ -57,6 +58,10 @@ class SpeakerVerifier:
         hyperparams = os.path.join(local_dir, "hyperparams.yaml")
         if not os.path.exists(hyperparams):
             return False
+        lt=os.path.join(local_dir,"label_encoder.txt")
+        lc=os.path.join(local_dir,"label_encoder.ckpt")
+        if os.path.exists(lt) and not os.path.exists(lc):
+            import shutil; shutil.copy2(lt,lc)
         return self._init_speechbrain(local_dir)
 
     def _try_load_default(self):
