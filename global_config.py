@@ -1,17 +1,144 @@
-# 固定音频标准（不能改）
+import os
+
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 SAMPLE_RATE = 16000
 CHANNELS = 1
 FORMAT = 16
 CHUNK = 1024
 
-# VAD参数
-VAD_AGGRESSIVENESS = 2
+PRE_EMPHASIS_COEFF = 0.97
+FRAME_LENGTH_MS = 25
+FRAME_SHIFT_MS = 10
+FFT_SIZE = 512
+N_MELS = 80
 
-# Whisper模型
-WHISPER_MODEL_SIZE = "base"  # 小模型，速度快
+VAD_AGGRESSIVENESS = 2
+VAD_FRAME_DURATION_MS = 30
+VAD_ENERGY_THRESHOLD = 0.01
+VAD_SPEECH_RATIO = 0.3
+
+WHISPER_MODEL_SIZE = "base"
 WHISPER_LANGUAGE = "zh"
 WHISPER_BEAM_SIZE = 5
 WHISPER_TEMPERATURE = 0.0
+WHISPER_COMPUTE_TYPE = "int8"
 
-# 指令映射
-COMMAND_MAP = {}
+SPEAKER_EMBEDDING_DIM = 192
+SPEAKER_SIMILARITY_THRESHOLD = 0.65
+SPEAKER_ENROLL_SAMPLES = 3
+
+INTENT_MODEL_NAME = "bert-base-chinese"
+INTENT_MAX_LENGTH = 64
+INTENT_CONFIDENCE_THRESHOLD = 0.5
+
+COMMAND_MAP = {
+    "打开记事本": "open_notepad",
+    "打开记事本应用": "open_notepad",
+    "启动记事本": "open_notepad",
+    "帮我开记事本": "open_notepad",
+    "我要用记事本": "open_notepad",
+    "打开浏览器": "open_browser",
+    "打开浏览器应用": "open_browser",
+    "启动浏览器": "open_browser",
+    "打开百度": "open_browser",
+    "帮我开浏览器": "open_browser",
+    "我要上网": "open_browser",
+    "音量调大": "volume_up",
+    "增大音量": "volume_up",
+    "声音大一点": "volume_up",
+    "音量增大": "volume_up",
+    "音量调高": "volume_up",
+    "声音调大": "volume_up",
+    "大声一点": "volume_up",
+    "把音量调大": "volume_up",
+    "音量调小": "volume_down",
+    "减小音量": "volume_down",
+    "声音小一点": "volume_down",
+    "音量减小": "volume_down",
+    "音量调低": "volume_down",
+    "声音调小": "volume_down",
+    "小声一点": "volume_down",
+    "把音量调小": "volume_down",
+    "打开计算器": "open_calculator",
+    "启动计算器": "open_calculator",
+    "帮我算一下": "open_calculator",
+    "打开文件管理器": "open_explorer",
+    "打开资源管理器": "open_explorer",
+    "浏览文件": "open_explorer",
+    "截屏": "screenshot",
+    "截图": "screenshot",
+    "截个图": "screenshot",
+    "屏幕截图": "screenshot",
+    "锁屏": "lock_screen",
+    "锁定屏幕": "lock_screen",
+    "锁住电脑": "lock_screen",
+    "关闭当前窗口": "close_window",
+    "关闭窗口": "close_window",
+    "把窗口关了": "close_window",
+    "打开任务管理器": "open_task_manager",
+    "查看任务管理器": "open_task_manager",
+    "打开设置": "open_settings",
+    "系统设置": "open_settings",
+    "打开命令行": "open_cmd",
+    "打开终端": "open_cmd",
+    "打开cmd": "open_cmd",
+}
+
+KEYWORD_INTENT_MAP = {
+    "记事本": "open_notepad",
+    "浏览器": "open_browser",
+    "百度": "open_browser",
+    "上网": "open_browser",
+    "音量": None,
+    "声音": None,
+    "大": "volume_up",
+    "小": "volume_down",
+    "高": "volume_up",
+    "低": "volume_down",
+    "增": "volume_up",
+    "减": "volume_down",
+    "计算器": "open_calculator",
+    "文件管理": "open_explorer",
+    "资源管理": "open_explorer",
+    "截屏": "screenshot",
+    "截图": "screenshot",
+    "锁屏": "lock_screen",
+    "锁定": "lock_screen",
+    "关闭": "close_window",
+    "任务管理": "open_task_manager",
+    "设置": "open_settings",
+    "命令行": "open_cmd",
+    "终端": "open_cmd",
+}
+
+INTENT_LABELS = [
+    "open_notepad", "open_browser", "volume_up", "volume_down",
+    "open_calculator", "open_explorer", "screenshot", "lock_screen",
+    "close_window", "open_task_manager", "open_settings", "open_cmd", "unknown"
+]
+
+INTENT_TRAIN_DATA = [
+    ("打开记事本", "open_notepad"), ("启动记事本", "open_notepad"), ("帮我开记事本", "open_notepad"),
+    ("记事本打开", "open_notepad"), ("我要用记事本", "open_notepad"),
+    ("打开浏览器", "open_browser"), ("启动浏览器", "open_browser"), ("帮我开浏览器", "open_browser"),
+    ("打开百度", "open_browser"), ("上网", "open_browser"), ("我要上网", "open_browser"),
+    ("音量调大", "volume_up"), ("增大音量", "volume_up"), ("声音大一点", "volume_up"),
+    ("把音量调高", "volume_up"), ("大声一点", "volume_up"), ("音量增加", "volume_up"),
+    ("音量调小", "volume_down"), ("减小音量", "volume_down"), ("声音小一点", "volume_down"),
+    ("把音量调低", "volume_down"), ("小声一点", "volume_down"), ("音量降低", "volume_down"),
+    ("打开计算器", "open_calculator"), ("启动计算器", "open_calculator"), ("帮我算一下", "open_calculator"),
+    ("打开文件管理器", "open_explorer"), ("打开资源管理器", "open_explorer"), ("浏览文件", "open_explorer"),
+    ("截屏", "screenshot"), ("截图", "screenshot"), ("截个图", "screenshot"), ("屏幕截图", "screenshot"),
+    ("锁屏", "lock_screen"), ("锁定屏幕", "lock_screen"), ("锁住电脑", "lock_screen"),
+    ("关闭当前窗口", "close_window"), ("关闭窗口", "close_window"), ("把窗口关了", "close_window"),
+    ("打开任务管理器", "open_task_manager"), ("查看任务管理器", "open_task_manager"),
+    ("打开设置", "open_settings"), ("系统设置", "open_settings"), ("打开命令行", "open_cmd"),
+    ("打开终端", "open_cmd"), ("打开cmd", "open_cmd"),
+]
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
+SPEAKER_DB_DIR = os.path.join(os.path.dirname(__file__), "speaker_db")
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(SPEAKER_DB_DIR, exist_ok=True)

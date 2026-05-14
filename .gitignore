@@ -1,8 +1,21 @@
-# 屏蔽整个模型文件夹（核心！）
 models/
-
-# 屏蔽Python缓存和临时文件
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
+dist/
+build/
+*.wav
+*.mp3
+*.flac
+data/
+speaker_db/
+*.json
+!requirements.txt
+.env
+*.log
+.vscode/
+.idea/
+*.pdf
+*.pptx
