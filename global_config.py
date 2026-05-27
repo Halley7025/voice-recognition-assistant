@@ -9,36 +9,71 @@ if sys.platform == "win32":
     if os.path.isdir(torch_lib):
         os.environ["PATH"] = torch_lib + ";" + os.environ.get("PATH", "")
 
-SAMPLE_RATE = 16000
-CHANNELS = 1
-FORMAT = 16
-CHUNK = 1024
+# Auto-loaded from config.yaml (with defaults for backward compat)
+try:
+    from config_loader import get as _cfg
+    SAMPLE_RATE = _cfg("audio.sample_rate", 16000)
+    CHANNELS = _cfg("audio.channels", 1)
+    FORMAT = _cfg("audio.format", 16)
+    CHUNK = _cfg("audio.chunk", 1024)
+    PRE_EMPHASIS_COEFF = _cfg("audio.pre_emphasis_coeff", 0.97)
+    FRAME_LENGTH_MS = _cfg("audio.frame_length_ms", 25)
+    FRAME_SHIFT_MS = _cfg("audio.frame_shift_ms", 10)
+    FFT_SIZE = _cfg("audio.fft_size", 512)
+    N_MELS = _cfg("audio.n_mels", 80)
+    VAD_AGGRESSIVENESS = _cfg("vad.aggressiveness", 2)
+    VAD_FRAME_DURATION_MS = _cfg("vad.frame_duration_ms", 30)
+    VAD_ENERGY_THRESHOLD = _cfg("vad.energy_threshold", 0.01)
+    VAD_SPEECH_RATIO = _cfg("vad.speech_ratio", 0.3)
+    WHISPER_MODEL_SIZE = _cfg("whisper.model_size", "small")
+    WHISPER_LANGUAGE = _cfg("whisper.language", "zh")
+    WHISPER_BEAM_SIZE = _cfg("whisper.beam_size", 5)
+    WHISPER_TEMPERATURE = _cfg("whisper.temperature", 0.0)
+    WHISPER_COMPUTE_TYPE = _cfg("whisper.compute_type", "int8")
+    SPEAKER_EMBEDDING_DIM = _cfg("speaker.embedding_dim", 192)
+    SPEAKER_SIMILARITY_THRESHOLD = _cfg("speaker.similarity_threshold", 0.50)
+    SPEAKER_ENROLL_SAMPLES = _cfg("speaker.enroll_samples", 3)
+    INTENT_MODEL_NAME = _cfg("intent.model_name", "bert-base-chinese")
+    INTENT_MAX_LENGTH = _cfg("intent.max_length", 64)
+    INTENT_CONFIDENCE_THRESHOLD = _cfg("intent.confidence_threshold", 0.5)
+except Exception:
+    # Fallback defaults if config.yaml not available
+    SAMPLE_RATE = 16000
+    CHANNELS = 1
+    FORMAT = 16
+    CHUNK = 1024
+    PRE_EMPHASIS_COEFF = 0.97
+    FRAME_LENGTH_MS = 25
+    FRAME_SHIFT_MS = 10
+    FFT_SIZE = 512
+    N_MELS = 80
+    VAD_AGGRESSIVENESS = 2
+    VAD_FRAME_DURATION_MS = 30
+    VAD_ENERGY_THRESHOLD = 0.01
+    VAD_SPEECH_RATIO = 0.3
+    WHISPER_MODEL_SIZE = "small"
+    WHISPER_LANGUAGE = "zh"
+    WHISPER_BEAM_SIZE = 5
+    WHISPER_TEMPERATURE = 0.0
+    WHISPER_COMPUTE_TYPE = "int8"
+    SPEAKER_EMBEDDING_DIM = 192
+    SPEAKER_SIMILARITY_THRESHOLD = 0.50
+    SPEAKER_ENROLL_SAMPLES = 3
+    INTENT_MODEL_NAME = "bert-base-chinese"
+    INTENT_MAX_LENGTH = 64
+    INTENT_CONFIDENCE_THRESHOLD = 0.5
 
-PRE_EMPHASIS_COEFF = 0.97
-FRAME_LENGTH_MS = 25
-FRAME_SHIFT_MS = 10
-FFT_SIZE = 512
-N_MELS = 80
+# Auto-detect device
+def _detect_device():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
 
-VAD_AGGRESSIVENESS = 2
-VAD_FRAME_DURATION_MS = 30
-VAD_ENERGY_THRESHOLD = 0.01
-VAD_SPEECH_RATIO = 0.3
-
-WHISPER_MODEL_SIZE = "base"
-WHISPER_LANGUAGE = "zh"
-WHISPER_BEAM_SIZE = 5
-WHISPER_TEMPERATURE = 0.0
-WHISPER_COMPUTE_TYPE = "int8"
-
-SPEAKER_EMBEDDING_DIM = 192
-SPEAKER_SIMILARITY_THRESHOLD = 0.65
-SPEAKER_ENROLL_SAMPLES = 3
-
-INTENT_MODEL_NAME = "bert-base-chinese"
-INTENT_MAX_LENGTH = 64
-INTENT_CONFIDENCE_THRESHOLD = 0.5
-
+DEVICE = _detect_device()
 COMMAND_MAP = {
     "打开记事本": "open_notepad",
     "打开记事本应用": "open_notepad",
@@ -204,3 +239,4 @@ MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 SPEAKER_DB_DIR = os.path.join(os.path.dirname(__file__), "speaker_db")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(SPEAKER_DB_DIR, exist_ok=True)
+

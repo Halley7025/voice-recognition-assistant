@@ -2,6 +2,12 @@ import sys
 import os
 import time
 
+# === HuggingFace Mirror (must be set BEFORE any HF/huggingface_hub import) ===
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "60"
+print("[I][system] HF_ENDPOINT -> hf-mirror.com")
+
 if sys.platform == "win32":
     torch_lib = os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib")
     if os.path.isdir(torch_lib):
@@ -51,6 +57,7 @@ class VoiceAssistant:
         self.current_user = None
         self.is_authenticated = False
         self.running = False
+        self.context = {"last_cmd": None, "last_text": None}
         print("=" * 50)
         print("系统初始化完成！")
         print("=" * 50)
@@ -65,7 +72,7 @@ class VoiceAssistant:
             if len(raw) == 0:
                 print("未检测到音频输入，请重试")
                 continue
-            processed = self.preprocessor.process(raw)
+            processed = self.preprocessor.process_for_speaker(raw)
             if len(processed) > SAMPLE_RATE * 0.5:
                 samples.append(processed)
                 print(f"采样 {i+1} 完成 (时长: {len(processed)/SAMPLE_RATE:.1f}s)")
@@ -82,7 +89,7 @@ class VoiceAssistant:
         print(f"\n身份验证: {user_id}")
         print("请说话进行声纹验证...")
         raw = self.capture.record_seconds(3)
-        processed = self.preprocessor.process(raw)
+        processed = self.preprocessor.process_for_speaker(raw)
         is_match, similarity = self.verifier.verify(user_id, processed)
         if is_match:
             self.current_user = user_id
@@ -96,18 +103,35 @@ class VoiceAssistant:
     def process_command(self, text):
         if not text or not text.strip():
             return None, "未检测到有效语音"
-        cmd = self.parser.parse(text)
+        # Multi-turn context: resolve anaphora
+        resolved = self._resolve_context(text)
+        cmd = self.parser.parse(resolved)
         if cmd:
+            self.context["last_cmd"] = cmd
+            self.context["last_text"] = text
             success, result = self.controller.run(cmd)
             return cmd, result
+        self.context["last_text"] = text
         return None, f"未理解指令: '{text}'"
+
+
+    def _resolve_context(self, text):
+        last = self.context.get("last_cmd")
+        if last and any(w in text for w in ["再", "继续", "也", "还"]):
+            if last in ("volume_up", "volume_down"):
+                if any(w in text for w in ["大", "高"]):
+                    return "音量调大"
+                elif any(w in text for w in ["小", "低"]):
+                    return "音量调小"
+                return {"volume_up": "音量调大", "volume_down": "音量调小"}.get(last, text)
+        return text
 
     def listen_and_execute(self):
         print("\n请说话...")
         raw = self.capture.record_seconds(3)
         if len(raw) == 0:
             return None, "未检测到音频"
-        processed = self.preprocessor.process(raw)
+        processed = self.preprocessor.process_for_speaker(raw)
         if len(processed) < 16000 * 0.3:
             return None, "语音过短，已忽略"
         text = self.recognizer.transcribe(processed)
@@ -213,3 +237,5 @@ def print_status():
 if __name__ == "__main__":
     from global_config import SAMPLE_RATE
     main()
+
+

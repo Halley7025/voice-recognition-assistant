@@ -2,6 +2,12 @@ import sys
 import os
 import time
 
+# === HuggingFace Mirror (must be set BEFORE any HF/huggingface_hub import) ===
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "60"
+print("[I][system] HF_ENDPOINT -> hf-mirror.com")
+
 if sys.platform == "win32":
     torch_lib = os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib")
     if os.path.isdir(torch_lib):
@@ -37,25 +43,14 @@ from controller.command_parser import CommandParser
 from controller.system_controller import SystemController
 from controller.speech_feedback import SpeechFeedback
 from controller.command_history import CommandHistory
+from controller.verification_gate import verify_and_execute
+from gui_waveform import WaveformWidget
+from gui_theme import COLORS, DARK_STYLE, apply_theme
+from gui_widgets import AcrylicCard, ListeningWidget
 from global_config import SAMPLE_RATE
 
 
-COLORS = {
-    "bg_dark": "#1a1a2e",
-    "bg_card": "#16213e",
-    "bg_input": "#0f3460",
-    "accent": "#e94560",
-    "accent_hover": "#ff6b6b",
-    "success": "#00b894",
-    "warning": "#fdcb6e",
-    "error": "#d63031",
-    "text_primary": "#ecf0f1",
-    "text_secondary": "#a0a0b0",
-    "text_muted": "#636e72",
-    "border": "#2d3436",
-    "gradient_start": "#667eea",
-    "gradient_end": "#764ba2",
-}
+# COLORS imported from gui_theme.py
 
 
 class AudioLevelWidget(QWidget):
@@ -168,9 +163,10 @@ class StatusIndicator(QWidget):
 
 
 class RecognizeThread(QThread):
-    result_ready = pyqtSignal(str, str, float)
+    result_ready = pyqtSignal(str, str, float, object)
     status_update = pyqtSignal(str)
     level_update = pyqtSignal(float)
+    chunk_ready = pyqtSignal(object)
 
     def __init__(self, capture, preprocessor, recognizer, parser, controller):
         super().__init__()
@@ -180,8 +176,34 @@ class RecognizeThread(QThread):
         self.parser = parser
         self.controller = controller
         self.running = True
+        self._ambient_rms = 0.001  # Initial ambient noise estimate
+        self._ambient_samples = 0
+
+    def _calibrate_ambient(self):
+        """Calibrate ambient noise level from first few chunks."""
+        samples = []
+        for _ in range(10):
+            try:
+                data = self.capture.stream.read(
+                    self.capture.chunk, exception_on_overflow=False
+                )
+                chunk = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                samples.append(np.sqrt(np.mean(chunk ** 2)))
+            except Exception:
+                continue
+        if samples:
+            self._ambient_rms = max(np.median(samples), 0.0001)
+            self._ambient_samples = len(samples)
+
+    def _get_speech_threshold(self):
+        """Adaptive speech threshold based on ambient noise."""
+        # Threshold = ambient * multiplier, with minimum floor
+        return max(self._ambient_rms * 3.0, 0.001)
 
     def run(self):
+        # Calibrate ambient noise before starting
+        self._calibrate_ambient()
+
         while self.running:
             try:
                 self.status_update.emit("listening")
@@ -189,7 +211,7 @@ class RecognizeThread(QThread):
                 silence_start = None
                 start_time = time.time()
                 has_speech = False
-                max_level = 0.0
+                speech_threshold = self._get_speech_threshold()
 
                 while self.running and (time.time() - start_time) < 10:
                     data = self.capture.stream.read(
@@ -199,10 +221,10 @@ class RecognizeThread(QThread):
                     chunks.append(chunk)
                     energy = np.sqrt(np.mean(chunk ** 2))
                     level = min(energy * 5, 1.0)
-                    max_level = max(max_level, level)
                     self.level_update.emit(level)
+                    self.chunk_ready.emit(chunk)
 
-                    if energy > 0.01:
+                    if energy > speech_threshold:
                         has_speech = True
                         silence_start = None
                     elif has_speech:
@@ -212,37 +234,56 @@ class RecognizeThread(QThread):
                             break
 
                 if not chunks:
-                    self.result_ready.emit("", "未检测到音频", 0)
+                    self.result_ready.emit("", "未检测到音频", 0, None)
                     continue
 
                 raw = np.concatenate(chunks)
                 if not has_speech or len(raw) < SAMPLE_RATE * 0.3:
-                    self.result_ready.emit("", "未检测到有效语音", 0)
+                    self.result_ready.emit("", "未检测到有效语音", 0, None)
+                    self.level_update.emit(0.0)
+                    continue
+
+                # Strict VAD: reject noise/silence before Whisper
+                vad_valid, speech_audio, vad_meta = self.preprocessor.strict_vad(raw)
+                if not vad_valid:
+                    reason = vad_meta.get("reason", "unknown")
+                    self.result_ready.emit("", f"VAD拒绝: {reason}", 0, None)
                     self.level_update.emit(0.0)
                     continue
 
                 self.status_update.emit("processing")
-                processed = self.preprocessor.process(raw)
+                processed = self.preprocessor.process(speech_audio)
+                if len(processed) < SAMPLE_RATE * 0.2:
+                    processed = self.preprocessor.process(speech_audio, use_spectral_subtraction=False)
+
                 start = time.time()
                 text = self.recognizer.transcribe(processed)
                 elapsed = time.time() - start
 
                 if not text:
-                    self.result_ready.emit("", "未识别到语音内容", elapsed)
+                    self.result_ready.emit("", "未识别到语音内容", elapsed, None)
                     self.level_update.emit(0.0)
                     continue
 
                 cmd = self.parser.parse(text)
                 if cmd:
                     self.status_update.emit("executing")
-                    success, result = self.controller.run(cmd)
-                    self.result_ready.emit(text, result, elapsed)
+                    # Use verification gate for protected commands
+                    success, result, verified, user_id, sim = verify_and_execute(
+                        cmd, raw, self.verifier, self.controller, self.preprocessor
+                    )
+                    if verified is not None:
+                        if verified:
+                            result = f"[{user_id}验证通过] {result}"
+                        else:
+                            result = f"[声纹验证失败] {result}"
+                    self.result_ready.emit(text, result, elapsed, raw)
                 else:
-                    self.result_ready.emit(text, "未匹配到有效指令", elapsed)
+                    self.result_ready.emit(text, "未匹配到有效指令", elapsed, raw)
 
                 self.level_update.emit(0.0)
             except Exception as e:
-                self.result_ready.emit("", f"错误: {e}", 0)
+                self.result_ready.emit("", f"错误: {e}", 0, None)
                 self.level_update.emit(0.0)
 
     def stop(self):
@@ -253,6 +294,11 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("语音识别助手")
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+        self._drag_pos = None
+        self._bg_pixmap = None
+        self._load_bg()
         self.setMinimumSize(1000, 700)
         self.resize(1100, 750)
         self.capture = AudioCapture()
@@ -267,8 +313,46 @@ class MainWindow(QMainWindow):
         self.recognize_thread = None
         self.current_user = None
         self.command_history = deque(maxlen=100)
+        self._components_loaded = True
         self._init_ui()
-        self._apply_theme()
+
+    def _load_bg(self):
+        bg_path = os.path.join(os.path.dirname(__file__), "bg.jpg")
+        if os.path.exists(bg_path):
+            self._bg_pixmap = QPixmap(bg_path)
+
+    def paintEvent(self, event):
+        if self._bg_pixmap and not self._bg_pixmap.isNull():
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform)
+            # Scale to fill window, keep aspect ratio, crop overflow
+            scaled = self._bg_pixmap.scaled(
+                self.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+            )
+            # Center-crop
+            x = (scaled.width() - self.width()) // 2
+            y = (scaled.height() - self.height()) // 2
+            painter.drawPixmap(0, 0, self.width(), self.height(), scaled, x, y, self.width(), self.height())
+            # Dark overlay for readability
+            painter.fillRect(self.rect(), QColor(10, 10, 26, 160))
+            painter.end()
+        else:
+            painter = QPainter(self)
+            painter.fillRect(self.rect(), QColor(10, 10, 26))
+            painter.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPos() - self._drag_pos)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
 
     def _init_ui(self):
         central = QWidget()
@@ -296,12 +380,13 @@ class MainWindow(QMainWindow):
         footer = self._create_footer()
         main_layout.addWidget(footer)
 
+
     def _create_header(self):
         header = QWidget()
-        header.setFixedHeight(64)
+        header.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         header.setStyleSheet(f"background-color: {COLORS['bg_dark']};")
         layout = QHBoxLayout(header)
-        layout.setContentsMargins(20, 0, 20, 0)
+        layout.setContentsMargins(20, 8, 16, 8)
 
         self.status_indicator = StatusIndicator()
         layout.addWidget(self.status_indicator)
@@ -314,48 +399,70 @@ class MainWindow(QMainWindow):
         layout.addStretch()
 
         self.user_label = QLabel("未登录")
-        self.user_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
+        self.user_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 13px;")
         layout.addWidget(self.user_label)
+
+        self.min_btn = QPushButton("—")
+        self.min_btn.setFixedSize(36, 28)
+        self.min_btn.setCursor(Qt.PointingHandCursor)
+        self.min_btn.clicked.connect(self.showMinimized)
+        layout.addWidget(self.min_btn)
+
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setFixedSize(36, 28)
+        self.close_btn.setCursor(Qt.PointingHandCursor)
+        self.close_btn.setStyleSheet(
+            "QPushButton{background:#ff5252;border-radius:6px;}"
+            "QPushButton:hover{background:#ff1744;}"
+        )
+        self.close_btn.clicked.connect(self.close)
+        layout.addWidget(self.close_btn)
 
         return header
 
     def _create_left_panel(self):
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        layout.setSpacing(12)
+        layout.setSpacing(15)
         layout.setContentsMargins(0, 0, 8, 0)
 
         voice_group = QGroupBox("语音控制")
         voice_layout = QVBoxLayout(voice_group)
-        voice_layout.setSpacing(10)
+        voice_layout.setSpacing(12)
 
-        self.audio_level = AudioLevelWidget()
-        voice_layout.addWidget(self.audio_level)
+        self.waveform = WaveformWidget()
+        voice_layout.addWidget(self.waveform)
+
+        mic_path = os.path.join(os.path.dirname(__file__), "mic.png")
+        self.listening_pulse = ListeningWidget(icon_path=mic_path, size=140)
+        voice_layout.addWidget(self.listening_pulse, alignment=Qt.AlignCenter)
 
         btn_row = QHBoxLayout()
-        self.listen_btn = QPushButton("  开始识别")
-        self.listen_btn.setFixedHeight(44)
+        btn_row.setSpacing(12)
+
+        self.listen_btn = QPushButton("🎤  开始识别")
         self.listen_btn.setCursor(Qt.PointingHandCursor)
+        self.listen_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.listen_btn.clicked.connect(self._toggle_listening)
         btn_row.addWidget(self.listen_btn)
 
-        self.stop_btn = QPushButton("  停止")
-        self.stop_btn.setFixedHeight(44)
+        self.stop_btn = QPushButton("⏹  停止")
         self.stop_btn.setCursor(Qt.PointingHandCursor)
         self.stop_btn.setEnabled(False)
+        self.stop_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.stop_btn.clicked.connect(self._stop_listening)
         btn_row.addWidget(self.stop_btn)
         voice_layout.addLayout(btn_row)
 
         manual_row = QHBoxLayout()
+        manual_row.setSpacing(10)
         self.manual_input = QLineEdit()
         self.manual_input.setPlaceholderText("输入指令文本...")
-        self.manual_input.setFixedHeight(38)
+        self.manual_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.manual_input.returnPressed.connect(self._manual_execute)
         manual_row.addWidget(self.manual_input)
 
         exec_btn = QPushButton("执行")
-        exec_btn.setFixedSize(60, 38)
         exec_btn.setCursor(Qt.PointingHandCursor)
         exec_btn.clicked.connect(self._manual_execute)
         manual_row.addWidget(exec_btn)
@@ -365,7 +472,7 @@ class MainWindow(QMainWindow):
 
         quick_group = QGroupBox("快捷操作")
         quick_grid = QGridLayout(quick_group)
-        quick_grid.setSpacing(8)
+        quick_grid.setSpacing(10)
         quick_cmds = [
             ("记事本", "open_notepad"), ("浏览器", "open_browser"),
             ("音量+", "volume_up"), ("音量-", "volume_down"),
@@ -374,8 +481,8 @@ class MainWindow(QMainWindow):
         ]
         for i, (label, cmd) in enumerate(quick_cmds):
             btn = QPushButton(label)
-            btn.setFixedSize(80, 36)
             btn.setCursor(Qt.PointingHandCursor)
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             btn.setProperty("cmd", cmd)
             btn.clicked.connect(lambda checked, c=cmd: self._execute_quick(c))
             quick_grid.addWidget(btn, i // 4, i % 4)
@@ -383,21 +490,20 @@ class MainWindow(QMainWindow):
 
         auth_group = QGroupBox("身份验证")
         auth_layout = QHBoxLayout(auth_group)
+        auth_layout.setSpacing(10)
         self.user_combo = QComboBox()
         self.user_combo.setEditable(True)
         self.user_combo.setPlaceholderText("选择用户")
-        self.user_combo.setFixedHeight(36)
+        self.user_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._refresh_user_list()
         auth_layout.addWidget(self.user_combo)
 
         enroll_btn = QPushButton("注册")
-        enroll_btn.setFixedSize(60, 36)
         enroll_btn.setCursor(Qt.PointingHandCursor)
         enroll_btn.clicked.connect(self._do_enroll)
         auth_layout.addWidget(enroll_btn)
 
         auth_btn = QPushButton("验证")
-        auth_btn.setFixedSize(60, 36)
         auth_btn.setCursor(Qt.PointingHandCursor)
         auth_btn.clicked.connect(self._do_auth)
         auth_layout.addWidget(auth_btn)
@@ -409,19 +515,20 @@ class MainWindow(QMainWindow):
     def _create_right_panel(self):
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        layout.setSpacing(12)
+        layout.setSpacing(15)
         layout.setContentsMargins(8, 0, 0, 0)
 
         right_tabs = QTabWidget()
 
         log_tab = QWidget()
         log_layout = QVBoxLayout(log_tab)
+        log_layout.setSpacing(10)
         self.log_display = QTextEdit()
         self.log_display.setReadOnly(True)
         self.log_display.setFont(QFont("Consolas", 10))
+        self.log_display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         log_layout.addWidget(self.log_display)
         clear_btn = QPushButton("清空日志")
-        clear_btn.setFixedHeight(30)
         clear_btn.setCursor(Qt.PointingHandCursor)
         clear_btn.clicked.connect(self.log_display.clear)
         log_layout.addWidget(clear_btn)
@@ -429,18 +536,19 @@ class MainWindow(QMainWindow):
 
         history_tab = QWidget()
         hist_layout = QVBoxLayout(history_tab)
+        hist_layout.setSpacing(10)
         self.history_display = QTextEdit()
         self.history_display.setReadOnly(True)
         self.history_display.setFont(QFont("Consolas", 10))
+        self.history_display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         hist_layout.addWidget(self.history_display)
         hist_btn_row = QHBoxLayout()
+        hist_btn_row.setSpacing(10)
         refresh_hist_btn = QPushButton("刷新")
-        refresh_hist_btn.setFixedHeight(30)
         refresh_hist_btn.setCursor(Qt.PointingHandCursor)
         refresh_hist_btn.clicked.connect(self._refresh_history)
         hist_btn_row.addWidget(refresh_hist_btn)
         clear_hist_btn = QPushButton("清空历史")
-        clear_hist_btn.setFixedHeight(30)
         clear_hist_btn.setCursor(Qt.PointingHandCursor)
         clear_hist_btn.clicked.connect(self._clear_history)
         hist_btn_row.addWidget(clear_hist_btn)
@@ -449,12 +557,12 @@ class MainWindow(QMainWindow):
 
         settings_tab = QWidget()
         settings_layout = QVBoxLayout(settings_tab)
+        settings_layout.setSpacing(15)
 
         tts_group = QGroupBox("语音反馈")
         tts_layout = QVBoxLayout(tts_group)
         self.tts_toggle = QPushButton("语音反馈: 关闭")
         self.tts_toggle.setCheckable(True)
-        self.tts_toggle.setFixedHeight(36)
         self.tts_toggle.setCursor(Qt.PointingHandCursor)
         self.tts_toggle.clicked.connect(self._toggle_tts)
         tts_layout.addWidget(self.tts_toggle)
@@ -463,7 +571,7 @@ class MainWindow(QMainWindow):
         info_group = QGroupBox("系统信息")
         info_layout = QVBoxLayout(info_group)
         self.info_label = QLabel()
-        self.info_label.setFont(QFont("Microsoft YaHei", 9))
+        self.info_label.setFont(QFont("Microsoft YaHei", 10))
         self.info_label.setWordWrap(True)
         self.info_label.setTextFormat(Qt.RichText)
         self._update_info_display()
@@ -490,125 +598,23 @@ class MainWindow(QMainWindow):
 
     def _create_footer(self):
         footer = QWidget()
-        footer.setFixedHeight(32)
+        footer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         footer.setStyleSheet(f"background-color: {COLORS['bg_dark']};")
         layout = QHBoxLayout(footer)
-        layout.setContentsMargins(16, 0, 16, 0)
+        layout.setContentsMargins(16, 4, 16, 4)
 
         self.status_text = QLabel("就绪")
-        self.status_text.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px;")
+        self.status_text.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px;")
         layout.addWidget(self.status_text)
 
         layout.addStretch()
 
         self.model_info = QLabel()
-        self.model_info.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px;")
+        self.model_info.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px;")
         model_name = self.recognizer.model_type or "未加载"
         self.model_info.setText(f"模型: Whisper-{model_name}")
         layout.addWidget(self.model_info)
         return footer
-
-    def _apply_theme(self):
-        self.setStyleSheet(f"""
-            QMainWindow {{
-                background-color: {COLORS['bg_card']};
-            }}
-            QGroupBox {{
-                font-weight: bold;
-                font-size: 13px;
-                color: {COLORS['text_primary']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 8px;
-                margin-top: 12px;
-                padding: 16px 12px 12px 12px;
-                background-color: {COLORS['bg_card']};
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-                color: {COLORS['gradient_start']};
-            }}
-            QPushButton {{
-                background-color: {COLORS['bg_input']};
-                color: {COLORS['text_primary']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-                padding: 6px 14px;
-                font-size: 12px;
-                font-weight: 500;
-            }}
-            QPushButton:hover {{
-                background-color: {COLORS['accent']};
-                border-color: {COLORS['accent']};
-            }}
-            QPushButton:pressed {{
-                background-color: {COLORS['accent_hover']};
-            }}
-            QPushButton:disabled {{
-                background-color: {COLORS['bg_dark']};
-                color: {COLORS['text_muted']};
-            }}
-            QLineEdit {{
-                background-color: {COLORS['bg_input']};
-                color: {COLORS['text_primary']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-                padding: 6px 10px;
-                font-size: 12px;
-            }}
-            QLineEdit:focus {{
-                border-color: {COLORS['gradient_start']};
-            }}
-            QComboBox {{
-                background-color: {COLORS['bg_input']};
-                color: {COLORS['text_primary']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-                padding: 6px 10px;
-                font-size: 12px;
-            }}
-            QComboBox QAbstractItemView {{
-                background-color: {COLORS['bg_input']};
-                color: {COLORS['text_primary']};
-                selection-background-color: {COLORS['accent']};
-            }}
-            QTextEdit {{
-                background-color: {COLORS['bg_dark']};
-                color: {COLORS['text_primary']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-                padding: 8px;
-                font-family: Consolas, monospace;
-                font-size: 11px;
-            }}
-            QTabWidget::pane {{
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-                background-color: {COLORS['bg_card']};
-            }}
-            QTabBar::tab {{
-                background-color: {COLORS['bg_dark']};
-                color: {COLORS['text_secondary']};
-                padding: 8px 16px;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-                margin-right: 2px;
-            }}
-            QTabBar::tab:selected {{
-                background-color: {COLORS['bg_card']};
-                color: {COLORS['text_primary']};
-            }}
-            QLabel {{
-                color: {COLORS['text_primary']};
-            }}
-        """)
-
-        shadow = QGraphicsDropShadowEffect()
-        shadow.setBlurRadius(20)
-        shadow.setColor(QColor(0, 0, 0, 60))
-        shadow.setOffset(0, 4)
-
     def _update_info_display(self):
         users = self.verifier.list_users()
         user_count = len(users)
@@ -692,12 +698,13 @@ class MainWindow(QMainWindow):
         self.recognize_thread.result_ready.connect(self._on_result)
         self.recognize_thread.status_update.connect(self._on_status)
         self.recognize_thread.level_update.connect(self._on_level)
+        self.recognize_thread.chunk_ready.connect(self.waveform.push_audio)
         self.recognize_thread.start()
         self.listen_btn.setText("  识别中...")
         self.listen_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.status_indicator.set_status("listening")
-        self.audio_level.set_active(True)
+        self.waveform.set_active(True)
         self.status_text.setText("正在监听...")
 
     def _stop_listening(self):
@@ -708,7 +715,7 @@ class MainWindow(QMainWindow):
         self.listen_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.status_indicator.set_status("idle")
-        self.audio_level.set_active(False)
+        self.waveform.set_active(False)
         self.status_text.setText("已停止")
 
     def _on_status(self, status):
@@ -721,9 +728,9 @@ class MainWindow(QMainWindow):
         self.status_text.setText(status_map.get(status, status))
 
     def _on_level(self, level):
-        self.audio_level.set_level(level)
+        pass  # Waveform receives audio via chunk_ready signal
 
-    def _on_result(self, text, result, elapsed):
+    def _on_result(self, text, result, elapsed, raw_audio=None):
         timestamp = time.strftime("%H:%M:%S")
         if text:
             self._log(f"<span style='color:{COLORS['text_muted']}'>[{timestamp}]</span> "
@@ -736,7 +743,16 @@ class MainWindow(QMainWindow):
         else:
             self._log(f"<span style='color:{COLORS['text_muted']}'>[{timestamp}]</span> "
                       f"<span style='color:{COLORS['warning']}'>{result}</span>")
-        self.status_indicator.set_status("success" if text else "idle")
+        # Only reset UI if the recognize thread has actually stopped
+        if not self.recognize_thread or not self.recognize_thread.running:
+            self.listen_btn.setText("  开始识别")
+            self.listen_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.waveform.set_active(False)
+            self.status_indicator.set_status("idle")
+        else:
+            self.status_indicator.set_status("success" if text else "listening")
+            QTimer.singleShot(800, lambda: self.status_indicator.set_status("listening") if self.recognize_thread and self.recognize_thread.running else None)
         self._update_info_display()
 
     def _manual_execute(self):
@@ -780,6 +796,9 @@ class MainWindow(QMainWindow):
         if not user_id:
             QMessageBox.warning(self, "提示", "请输入或选择用户名")
             return
+        if user_id not in self.verifier.list_users():
+            QMessageBox.warning(self, "提示", f"用户 '{user_id}' 未注册，请先注册。")
+            return
         self.status_text.setText(f"正在验证 {user_id}...")
         self.status_indicator.set_status("processing")
         QApplication.processEvents()
@@ -805,10 +824,21 @@ class MainWindow(QMainWindow):
         self._update_info_display()
 
     def _do_enroll(self):
+        if not self._components_loaded:
+            QMessageBox.warning(self, "提示", "组件加载中，请稍候...")
+            return
+        if not self.verifier or self.verifier.model is None:
+            QMessageBox.warning(self, "提示", "声纹模型未加载，无法注册用户。\n请确认已安装 speechbrain 库。")
+            return
         user_id = self.user_combo.currentText().strip()
         if not user_id:
             QMessageBox.warning(self, "提示", "请输入用户名")
             return
+        if user_id in self.verifier.list_users():
+            reply = QMessageBox.question(self, "提示", f"用户 '{user_id}' 已存在，是否重新注册？",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
         timestamp = time.strftime("%H:%M:%S")
         self._log(f"<span style='color:{COLORS['text_muted']}'>[{timestamp}]</span> "
                   f"<span style='color:{COLORS['gradient_start']}'>开始注册: {user_id}</span>")
@@ -844,14 +874,46 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+from PyQt5.QtWidgets import QStackedWidget
+
 def main():
     app = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei", 10))
     app.setStyle("Fusion")
-    window = MainWindow()
-    window.show()
+    apply_theme(app)
+
+    stack = QStackedWidget()
+    stack.setWindowTitle("语音识别助手")
+    stack.setMinimumSize(1000, 700)
+
+    # Create shared components
+    main_win = MainWindow()
+
+    # Create login window (shares the same capture/preprocessor/verifier)
+    from gui_login import LoginWindow
+    login_win = LoginWindow(
+        main_win.capture, main_win.preprocessor, main_win.verifier
+    )
+
+    stack.addWidget(login_win)   # index 0
+    stack.addWidget(main_win)    # index 1
+
+    def on_login_success(user_id):
+        if user_id and user_id != "guest":
+            main_win.current_user = user_id
+            main_win.user_label.setText(f"  {user_id}")
+            main_win.user_label.setStyleSheet(
+                f"color: {COLORS['success']}; font-size: 12px;"
+            )
+        stack.setCurrentIndex(1)
+
+    login_win.login_success.connect(on_login_success)
+    stack.setCurrentIndex(0)
+    stack.show()
     sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
     main()
+
+

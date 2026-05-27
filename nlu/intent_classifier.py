@@ -1,6 +1,8 @@
 import os
 import time
 import numpy as np
+from logger_config import setup_logger
+_log = setup_logger(__name__)
 from global_config import (
     INTENT_MODEL_NAME, INTENT_MAX_LENGTH, INTENT_LABELS,
     INTENT_TRAIN_DATA, INTENT_CONFIDENCE_THRESHOLD
@@ -41,12 +43,12 @@ class IntentClassifier:
 
             self.intent_head = IntentHead(768, self.num_labels)
             self.ready = True
-            print("意图分类模型加载成功 (BERT-base-chinese)")
+            _log.info("意图分类模型加载成功 (BERT-base-chinese)")
         except Exception as e:
-            print(f"意图分类模型加载失败: {e}")
+            _log.error(f"意图分类模型加载失败: {e}")
             self.ready = False
 
-    def encode(self, text):
+    def encode(self, text: str):
         if self.tokenizer is None:
             return None
         inputs = self.tokenizer(
@@ -55,7 +57,7 @@ class IntentClassifier:
         )
         return inputs
 
-    def predict(self, text):
+    def predict(self, text: str):
         if not self.ready:
             return self._fallback_predict(text)
         try:
@@ -73,7 +75,7 @@ class IntentClassifier:
                 return "unknown", confidence
             return label, confidence
         except Exception as e:
-            print(f"意图预测错误: {e}")
+            _log.error(f"意图预测错误: {e}")
             return self._fallback_predict(text)
 
     def _fallback_predict(self, text):
@@ -90,7 +92,7 @@ class IntentClassifier:
 
     def train(self, train_data=None, epochs=5, lr=2e-5):
         if not self.ready:
-            print("模型未就绪，无法训练")
+            _log.warning("模型未就绪，无法训练")
             return
         import torch
         import torch.nn as nn
@@ -132,4 +134,4 @@ class IntentClassifier:
             print(f"Epoch {epoch+1}/{epochs} Loss: {total_loss/len(loader):.4f}")
         self.bert.eval()
         self.intent_head.eval()
-        print("意图分类模型训练完成")
+        _log.info("意图分类模型训练完成")

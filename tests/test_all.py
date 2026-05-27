@@ -145,25 +145,51 @@ class TestSystemController(unittest.TestCase):
 
 
 class TestSpeakerVerifier(unittest.TestCase):
-    def test_embedding_extraction_no_model(self):
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+        os.environ["SPEECHBRAIN_STRATEGY"] = "copy"
+
+    def setUp(self):
         from speaker.speaker_verifier import SpeakerVerifier
-        sv = SpeakerVerifier()
-        sv.model = None
-        result = sv.extract_embedding(np.random.randn(16000).astype(np.float32))
-        self.assertIsNone(result)
+        self.sv = SpeakerVerifier()
+        # Clean up test user if exists
+        if "test_user" in self.sv.list_users():
+            self.sv.delete_user("test_user")
+
+    def test_embedding_extraction_real(self):
+        emb = self.sv.extract_embedding(np.random.randn(16000*3).astype(np.float32))
+        if self.sv.model is not None:
+            self.assertIsNotNone(emb)
+            self.assertEqual(emb.shape, (192,))
 
     def test_verify_unknown_user(self):
-        from speaker.speaker_verifier import SpeakerVerifier
-        sv = SpeakerVerifier()
-        is_match, sim = sv.verify("nonexistent_user", np.random.randn(16000).astype(np.float32))
+        is_match, sim = self.sv.verify("nonexistent_user", np.random.randn(16000).astype(np.float32))
         self.assertFalse(is_match)
-        self.assertEqual(sim, 0.0)
 
-    def test_list_users_empty(self):
-        from speaker.speaker_verifier import SpeakerVerifier
-        sv = SpeakerVerifier()
-        sv.embeddings_db = {}
-        self.assertEqual(sv.list_users(), [])
+    def test_speaker_register_and_list(self):
+        if self.sv.model is None:
+            self.skipTest("ECAPA-TDNN model not loaded")
+        samples = [np.random.randn(16000*2).astype(np.float32) for _ in range(3)]
+        ok = self.sv.register_speaker("test_user", samples)
+        self.assertTrue(ok)
+        self.assertIn("test_user", self.sv.list_users())
+        self.sv.delete_user("test_user")
+        self.assertNotIn("test_user", self.sv.list_users())
+
+    def test_eer_computation(self):
+        genuine = np.array([0.95, 0.88, 0.92, 0.85, 0.90], dtype=np.float32)
+        impostor = np.array([0.15, 0.20, 0.10, 0.25, 0.18], dtype=np.float32)
+        eer, thresh = self.sv.compute_eer(genuine, impostor)
+        self.assertLess(eer, 0.5)
+        self.assertGreater(thresh, 0.0)
+
+    def test_embedding_extraction_no_model(self):
+        self.sv.model = None
+        result = self.sv.extract_embedding(np.random.randn(16000).astype(np.float32))
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

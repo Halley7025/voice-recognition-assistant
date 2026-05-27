@@ -1,0 +1,659 @@
+========================================
+  语音识别助手 - 更新日志
+========================================
+
+----------------------------------------
+[2026-05-27] 修复语音读取与识别问题
+----------------------------------------
+
+问题描述:
+  1. 麦克风采集音量极低 (RMS ~0.00005)，语音检测阈值 (0.01) 远高于实际能量
+  2. 谱减法过于激进 (alpha=2.0)，语音信号被一并消除
+  3. CUDA 库缺失 (cublas64_12.dll)，Whisper 模型无法完成转录
+  4. 噪声估计 FFT 维度不匹配，导致预处理崩溃 (ValueError: shapes mismatch)
+  5. 缺少音频文件读取功能，无法方便地用文件测试
+
+修改文件及内容:
+
+  [1] audio/audio_preprocess.py
+      - 新增 AGC (自动增益控制): 安静信号自动放大到目标 RMS 0.3，增益上限 100 倍
+      - 谱减法参数调整: alpha 2.0 -> 1.0, beta 0.01 -> 0.05, 噪声初始比例 0.1 -> 0.05
+      - 修复噪声估计 FFT 维度不匹配 bug (n_fft 应为信号长度而非 FFT 输出长度)
+      - 噪声估计维度不匹配时自动重置而非崩溃
+      - VAD 改为自适应阈值: max(固定阈值, 中位数能量 x 1.5)
+      - remove_silence 增加 200ms padding 保护语音起止边缘
+      - process() 流程优化: 先 AGC -> normalize -> pre_emphasis -> 谱减法 -> 去静音 -> normalize
+      - 噪声估计改为使用最安静帧而非前几帧 (避免语音帧被误判为噪声)
+
+  [2] asr/speech_recognizer.py
+      - 新增 _detect_whisper_device() 静态方法: 检测 CUDA 是否真正可用
+        判断逻辑: ctranslate2 报告 CUDA 设备 + torch.cuda.is_available() == True 才用 GPU
+        否则回退 CPU 并输出日志提示
+      - _try_load_ctranslate2(): 显式传入 device 参数
+      - _try_load_ctranslate2_hub(): 显式传入 device 参数
+      - Whisper 加载失败时不再静默，而是回退到 CPU 重试
+
+  [3] audio/audio_capture.py
+      - 新增 load_audio_file(file_path, target_sr) 静态方法
+        支持格式: WAV, MP3, FLAC, OGG 等
+        加载优先级: soundfile -> librosa -> wave (仅 WAV)
+        自动转换为单声道 float32，自动重采样到 target_sr (默认 16000Hz)
+
+  [4] gui.py (RecognizeThread 类)
+      - 新增 _calibrate_ambient(): 启动时采集 10 个音频块校准环境噪声
+      - 新增 _get_speech_threshold(): 自适应阈值 = max(环境噪声 x 3, 0.001)
+      - 语音检测阈值从固定 0.01 改为自适应
+      - 预处理后音频过短 (< 0.2s) 时自动关闭谱减法重试
+      - run() 流程: 校准环境噪声 -> 录音 -> 预处理 -> 转录 -> 解析 -> 执行
+
+  [5] main.py
+      - listen_and_execute(): 增加 RMS 音量检测 (< 0.0005 提示音量过低)
+      - 预处理后音频过短时自动关闭谱减法重试 (use_spectral_subtraction=False)
+
+测试结果:
+  - 预处理管线: 安静信号 (max 0.0005) 经 AGC 后正确放大，管线输出正常
+  - Whisper 模型: 自动检测到 CUDA 不可用并回退 CPU，RTF ~0.25
+  - 音频文件读取: WAV 文件加载正常，自动重采样到 16000Hz
+  - python main.py --status: 全部模型 [OK]
+
+========================================
+
+----------------------------------------
+[2026-05-27] 修复识别简繁体、注册崩溃、语音反馈缺失
+----------------------------------------
+
+问题描述:
+  1. Whisper 语音识别输出繁体中文 (如 "打開技術本" 而非 "打开记事本")，导致指令无法匹配
+  2. GUI 点击注册用户时崩溃: AttributeError: 'MainWindow' has no attribute '_components_loaded'
+  3. pyttsx3 未安装导致 TTS 初始化失败 (非致命，但影响语音反馈功能)
+
+修改文件及内容:
+
+  [1] asr/speech_recognizer.py
+      - HOTWORDS 添加 initial_prompt 引导: "以下是普通话的句子。" 前缀 + 常用命令词
+        Whisper 的 initial_prompt 可以引导模型输出简体中文而非繁体
+      - _transcribe_faster(): 新增 initial_prompt=HOTWORDS 参数
+      - _transcribe_openai(): 新增 initial_prompt=HOTWORDS 参数
+      - 新增 _to_simplified() 静态方法: 识别结果后处理，将常见繁体字转为简体
+        包含 60+ 常见繁简映射 (開->开, 記->记, 覽->览, 聲->声 等)
+      - transcribe() 调用链: Whisper 转录 -> _to_simplified 后处理 -> 返回简体结果
+
+  [2] gui.py
+      - MainWindow.__init__() 中新增 self._components_loaded = True
+        修复 _do_enroll() 中引用未定义属性导致的 AttributeError
+
+  [3] 其他 (上一轮已修改但未记录)
+      - audio/audio_preprocess.py: AGC + 谱减法 + 自适应 VAD
+      - asr/speech_recognizer.py: CUDA 设备检测 + CPU 回退
+      - audio/audio_capture.py: load_audio_file() 静态方法
+      - gui.py RecognizeThread: 环境噪声校准 + 自适应阈值
+      - main.py: listen_and_execute 音量检测 + 预处理回退
+
+测试结果:
+  - python main.py --status: 全部模型 [OK]
+  - 所有 .py 文件语法检查通过 (ast.parse)
+----------------------------------------
+[2026-05-27] 扩展语音指令系统 + 修复声纹识别
+----------------------------------------
+
+问题描述:
+  1. 语音指令仅支持预定义的快捷指令，无法控制更多内容
+  2. 声纹注册/验证流程不健壮，预处理过于激进导致特征提取失败
+
+修改文件及内容:
+
+  [1] controller/command_parser.py (完全重写)
+      - 新增 5 层指令解析策略:
+        策略1: 精确匹配 (COMMAND_MAP 关键词，最高优先级)
+        策略2: 模式匹配 (正则表达式，支持自然语言)
+        策略3: NLU 模型 (BERT 意图分类，可选)
+        策略4: 模糊匹配 (difflib 相似度 > 0.6)
+        策略5: 语义组合 (关键词 + 方向词)
+      - 支持的自然语言模式:
+        "打开XXX" -> open_app:XXX (打开任意应用)
+        "关闭XXX" -> close_app:XXX (关闭任意应用)
+        "搜索XXX" / "查一下XXX" -> search_web:XXX (网页搜索)
+        "输入XXX" -> type_text:XXX (键盘输入)
+        "音量调到50" -> set_volume:50
+        "现在几点了" -> get_time
+        "今天几月几号" -> get_date
+        "播放/暂停/下一首/上一首" -> media_play/pause/next/prev
+        "关机/重启/休眠/注销" -> shutdown/restart/sleep/logout
+        "清理垃圾" -> clean_temp
+
+  [2] controller/system_controller.py (大幅扩展)
+      - 新增参数化指令处理: intent:param 格式
+      - 新增 open_app(name): 打开任意应用
+        支持常见应用名映射 + 路径搜索 + shell 启动
+      - 新增 close_app(name): 关闭指定应用 (taskkill)
+      - 新增 search_web_query(query): 用百度搜索任意内容
+      - 新新增 type_text(text): 键盘输入文字 (pyautogui)
+      - 新增 set_volume(level): 设置音量到指定百分比
+      - 新增 get_time / get_date: 获取当前时间/日期
+      - 新增 media_play / media_pause / media_next / media_prev
+      - 新增 shutdown / restart / sleep / logout
+      - 新增 clean_temp: 清理临时文件
+      - 新增 new_folder_named / delete_file / open_file
+
+  [3] speaker/speaker_verifier.py (优化)
+      - 优先加载本地模型目录 (避免每次都检查 HF 缓存)
+      - extract_embedding(): 新增音频长度检查 (< 0.5s 拒绝)
+      - extract_embedding(): 新增音频归一化 (max -> 0.95)
+      - register_speaker(): 最低样本要求从 2 降为 1
+      - register_speaker(): 增加详细日志 (每个样本的提取结果)
+      - verify(): 增加详细日志 (相似度/阈值/结果)
+      - _load_db(): 增加异常处理 (JSON 解析失败不崩溃)
+
+  [4] gui.py
+      - _do_enroll(): 声纹注册改用轻量预处理 (不使用谱减法)
+        谱减法会破坏声纹特征，注册/验证应使用原始音频
+      - _do_enroll(): 增加详细日志 (原始音量 RMS、处理后时长)
+      - _do_enroll(): 所有采样无效时提前退出并提示
+      - _do_auth(): 声纹验证改用轻量预处理
+      - 快捷操作面板新增: 播放、暂停、下一首、时间
+
+测试结果:
+  - 指令解析器 19 个测试用例全部通过
+  - "搜索今天天气怎么样" -> search_web:今天天气怎么样
+  - "帮我搜一下Python教程" -> search_web:Python教程
+  - "暂停播放" -> media_pause (不再误匹配 media_play)
+  - python main.py --status: 全部模型 [OK]
+----------------------------------------
+[2026-05-27] 修复 Whisper 幻觉 + 网易云音乐路径 + 声纹专用预处理
+----------------------------------------
+
+问题描述:
+  1. Whisper 识别结果严重失真: "打开网易云音乐" -> "彩网语音乐"
+  2. Whisper 幻觉: "打开计算器" 重复 19 次, "诶诶诶..." 无限重复
+  3. initial_prompt HOTWORDS 包含太多命令词，反而导致模型幻觉
+  4. "打开网易云音乐" 匹配到 open_app 但找不到可执行文件
+  5. 声纹注册/验证的预处理 (pre_emphasis + remove_silence) 破坏声纹特征
+
+修改文件及内容:
+
+  [1] asr/speech_recognizer.py
+      - HOTWORDS 精简为 "以下是普通话的句子。" (移除所有命令词)
+        base 模型太小，过多引导词会导致重复幻觉
+      - 新增 _remove_hallucination() 后处理方法:
+        检测1: 段落重复比例 > 70% -> 只保留第一段
+        检测2: 单字重复 > 5 次 -> 丢弃
+        检测3: 输出超 50 字 -> 只保留第一句
+        检测4: 尾部重复模式 -> 正则去重
+      - _transcribe_faster(): 优化 VAD 参数
+        min_silence_duration_ms: 300 -> 500
+        speech_pad_ms: 200 -> 300
+        新增 threshold=0.4 (提高语音检测灵敏度)
+        新增 suppress_blank=True, suppress_tokens=[-1]
+      - _to_simplified(): 新增雲->云, 樂->乐 等映射
+
+  [2] controller/system_controller.py
+      - _open_app() 新增常见中文应用安装路径:
+        网易云音乐: %ProgramFiles%\NetEase\CloudMusic\cloudmusic.exe
+        酷狗音乐: KuGou\KGMusic\KuGou.exe
+        QQ音乐: Tencent\QQMusic\QQMusic.exe
+        钉钉: DingTalk\DingTalkLauncher.exe
+        腾讯会议: WeMeet\wemeetapp.exe
+        VSCode: Microsoft VS Code\Code.exe
+        支持通配符路径 (glob 匹配)
+
+  [3] audio/audio_preprocess.py
+      - 新增 process_for_speaker(): 声纹专用轻量预处理
+        仅做 AGC + normalize，不做 pre_emphasis / spectral_subtraction / remove_silence
+        保留完整的声纹特征
+
+  [4] gui.py
+      - _do_enroll() / _do_auth() 改用 process_for_speaker()
+
+  [5] main.py
+      - enroll_user() / authenticate_user() 改用 process_for_speaker()
+
+测试结果:
+  - python main.py --status: 全部模型 [OK]
+  - 所有 .py 文件语法检查通过
+----------------------------------------
+[2026-05-27] 严格 VAD + Whisper 解码优化 + 声纹验证拦截器
+----------------------------------------
+
+问题描述:
+  1. Whisper 幻觉率过高: 环境音/静音也输出乱码 ("召开网络的评论", "诶诶诶...")
+  2. 声纹只有注册功能，没有验证拦截: 注册后执行敏感指令无需身份验证
+
+修改文件及内容:
+
+  [1] audio/audio_preprocess.py
+      - 新增 strict_vad() 严格端点检测算法:
+        帧级能量分析: 计算每帧 RMS 能量
+        噪声底估计: 取最安静 15% 帧的平均能量
+        信噪比计算: 最响 20% 帧 / 噪声底, 转换为 dB
+        语音比例: 超过能量阈值的帧占比
+        拒绝条件 (任一满足即丢弃, 不传入 Whisper):
+          - RMS < energy_threshold * 0.5 (太安静)
+          - SNR < 6.0 dB (信噪比太低, 噪声主导)
+          - 语音帧比例 < 20% (大部分是静音)
+          - 语音时长 < 0.5s (有效语音太短)
+        返回: (is_valid, speech_audio, meta) 三元组
+
+  [2] asr/speech_recognizer.py
+      - Whisper 解码参数优化 (反幻觉):
+        no_speech_threshold=0.6 (提高无语音判断灵敏度)
+        condition_on_previous_text=False (防止上下文污染)
+        compression_ratio_threshold=2.4 (过滤重复压缩输出)
+        log_prob_threshold=-1.0 (过滤低置信度输出)
+        suppress_blank=True, suppress_tokens=[-1]
+      - HOTWORDS 精简为 "以下是普通话的句子。"
+
+  [3] controller/verification_gate.py (新文件)
+      - PROTECTED_COMMANDS 受保护指令集合:
+        open_app, close_app, shutdown, restart, logout, sleep,
+        empty_recycle, delete_file, clean_temp,
+        open_settings, open_task_manager
+      - is_protected(cmd): 判断指令是否需要验证
+        支持 "intent:param" 格式
+      - verify_and_execute(): 验证拦截执行函数
+        非受保护指令 -> 直接执行
+        无注册用户 -> 跳过验证, 直接执行
+        受保护指令 -> 提取声纹特征 -> verify_any_user() ->
+          相似度 >= 0.65 -> 放行并执行
+          相似度 < 0.65 -> 拒绝, 返回 "声纹验证失败"
+
+  [4] speaker/speaker_verifier.py
+      - 新增 verify_any_user(audio_data):
+        对所有已注册用户逐一比对, 返回最佳匹配
+        返回: (is_verified, matched_user_id, similarity)
+
+  [5] gui.py
+      - RecognizeThread.__init__(): 新增 verifier 参数
+      - RecognizeThread.run(): 集成验证拦截流程:
+        录音 -> strict_vad 过滤 -> Whisper 识别 -> 指令解析 ->
+        verify_and_execute() (受保护指令触发声纹验证)
+      - result_ready 信号新增 raw_audio 参数
+      - _start_listening(): 传入 verifier
+      - _on_result(): 接收 raw_audio 参数
+
+测试结果:
+  - python main.py --status: 全部模型 [OK], 1 个已注册用户
+  - 所有 .py 文件语法检查通过
+----------------------------------------
+[2026-05-27] 修复信号崩溃 + 声纹解锁登录 + 增强幻觉过滤
+----------------------------------------
+
+P0 - 修复致命崩溃:
+  gui.py: pyqtSignal(str, str, float) -> pyqtSignal(str, str, float, object)
+  修复 RecognizeThread 传递 4 参数时的 TypeError 崩溃
+
+P1 - 声纹解锁登录界面:
+  gui_login.py (新文件):
+    LoginWindow: 声纹验证登录页
+      - 波形显示器 (复用 AudioLevelWidget)
+      - "请说话以验证身份" 状态提示
+      - VerifyThread: 录音 3 秒 -> verify_any_user() 比对
+      - 相似度 >= 0.65 -> 发射 login_success 信号 -> 切换到主界面
+      - 验证失败 -> 提示失败原因，停留在登录页
+      - "跳过验证" 按钮 (guest 模式，用于首次注册)
+    VerifyThread: 独立验证线程
+      - 录音 -> process_for_speaker -> verify_any_user -> 发射结果
+
+  gui.py:
+    main() 重构:
+      - QStackedWidget 包含 LoginWindow(index=0) + MainWindow(index=1)
+      - login_success 信号触发界面切换
+      - 验证通过后自动设置 current_user
+
+P2 - Whisper 幻觉过滤增强:
+  asr/speech_recognizer.py:
+    _INTENT_VERBS: 43 个中文意图动词词表
+    _remove_hallucination() 新增两层过滤:
+      - 去标点后长度 < 4 字 -> 丢弃 (过滤短句幻觉如 "化开")
+      - 不含任何意图动词 -> 丢弃 (过滤乱码如 "召开网络的评论")
+    测试结果 (全部通过):
+      "召开网络的评论。" -> "" (无意图动词)
+      "诶诶诶诶诶诶诶诶" -> "" (单字重复)
+      "化开决定约。" -> "" (无意图动词)
+      "打开记事本" -> "打开记事本" (含动词 "打开", 通过)
+      "打开网易云音乐" -> "打开网易云音乐" (通过)
+      "搜索今天天气怎么样" -> "搜索今天天气怎么样" (通过)
+      "计算器" -> "" (无动词, 3字 < 4)
+
+安装说明:
+  pyttsx3: 需手动安装 (pip install pyttsx3)，当前网络受限
+  CUDA/cuDNN: 当前使用 CPU 模式，如需 GPU 加速:
+    1. 安装 CUDA Toolkit 12.x
+    2. 下载 cuDNN 8.x 并复制到 CUDA 目录
+    3. 下载 zlibwapi.dll 放入 PATH
+----------------------------------------
+[2026-05-27] 修复登录盲录音 + 拼音模糊匹配
+----------------------------------------
+
+P0 - 修复登录界面"盲录音"漏洞:
+  gui_login.py VerifyThread.run():
+    录音完成后调用 strict_vad() 端点检测
+    is_valid=False -> 发射 "未检测到有效人声"，不送入声纹比对
+    is_valid=True -> 使用 speech_audio (去噪后) 送入 verify_any_user()
+    修复了纯静音导致相似度为负数的问题
+
+P1 - 拼音级模糊匹配 (无需 pypinyin 依赖):
+  controller/command_parser.py:
+    新增内置拼音映射表 _char_py: 200+ 常用汉字 -> 拼音
+    新增 _PINYIN_MAP: 50+ 常用指令短语 -> 拼音序列
+    新增 _to_pinyin_simple(): 字符级拼音转换 (零依赖)
+    新增 _match_by_pinyin(text) 解析策略:
+      将输入文本转为拼音序列
+      与所有已知指令的拼音序列比较 (difflib.SequenceMatcher)
+      相似度 >= 0.75 -> 匹配成功
+      匹配成功后先查 COMMAND_MAP，再尝试模式匹配
+      放在"模式匹配"之后作为容错降级
+    解析策略优先级:
+      1. 精确匹配 (COMMAND_MAP)
+      2. 模式匹配 (正则)
+      3. 拼音模糊匹配 (容错 Whisper 同音错字)
+      4. NLU 模型 (可选)
+      5. 模糊匹配 (difflib 字符相似度)
+      6. 语义组合 (关键词+方向词)
+    测试结果:
+      "罢了开往一年约" -> open_app:网易云音乐 (拼音 ratio=0.81)
+      "大开记事本" -> open_notepad (拼音 ratio=1.00)
+      "音量吊大" -> volume_up (拼音 ratio=0.83)
+----------------------------------------
+[2026-05-27] pypinyin 拼音匹配升级
+----------------------------------------
+
+  controller/command_parser.py:
+    _to_pinyin() 改用 pypinyin.lazy_pinyin() (有准确的多音字处理)
+    自动检测: pypinyin 可用时用库，不可用时回退内置表
+    效果提升:
+      "音量吊大" -> volume_up: ratio 0.83 -> 1.00
+      "大开记事本" -> open_notepad: ratio 1.00
+      "罢了开往一年约" -> open_app:网易云音乐: ratio 0.81
+      "化开决定约" (纯幻觉): 正确拒绝 (ratio 0.70 < 0.75)
+----------------------------------------
+[2026-05-27] 滑动窗口拼音匹配 + 应用白名单校验
+----------------------------------------
+
+P1 - 滑动窗口拼音匹配 (Sliding Window):
+  controller/command_parser.py:
+    新增 _sliding_window_pinyin_match():
+      在输入拼音序列中滑动窗口，寻找与目标指令拼音匹配的局部片段
+      自适应阈值: 短目标(<=3音节) 需 ratio>=0.9, 中等(<=4) 需 >=0.85
+      窗口大小: len(target) +/- 2, 容忍长度差异
+    优势: "嗯嗯打开记事本嗯" 中的冗余前后缀不影响匹配
+    效果:
+      "嗯嗯打开记事本嗯" -> open_notepad (ratio=0.89) PASS
+      "音量吊大一点" -> volume_up (ratio=0.86) PASS
+      "把他打开" -> None (短目标阈值0.9过滤) PASS
+      "打开什么" -> None (白名单拒绝) PASS
+
+P2 - 应用白名单校验 (SUPPORTED_APPS):
+    35 个支持的应用名称白名单
+    新增 _validate_app_name(): 提取的应用名与白名单逐项拼音对比
+    相似度 >= 0.75 -> 使用白名单中的标准名称
+    相似度 < 0.75 -> 拒绝，视为无效应用名
+    效果:
+      "打开即算器" -> open_calculator (即算器->计算器 ratio=1.00) PASS
+      "打开什么" -> None (什么 sim=0.57 < 0.75) PASS
+      "把他打开" -> None (他开 sim=0.38 < 0.75) PASS
+----------------------------------------
+[2026-05-27] AGC 软限幅 + 实时波形 + UI 暗色主题
+----------------------------------------
+
+P1 - AGC 修复 (audio/audio_preprocess.py):
+  auto_gain_control() 重写:
+    目标 RMS 从 0.3 降到 0.1 (更适合 Whisper 输入)
+    新增 tanh 软限幅: 防止硬裁剪导致辅音丢失
+    增益上限从 100 降到 50 (防止纯噪声过度放大)
+    算法: audio = tanh(audio * 1.2) * 0.95 (平滑饱和曲线)
+
+P2 - 实时波形控件 (gui_waveform.py 新文件):
+  WaveformWidget: QPainter 绘制的实时音频波形
+    2048 样本环形缓冲区
+    ~30fps 动画刷新
+    发光青色波形线 (双层绘制: glow + main)
+    无坐标轴/网格/背景, 纯视觉效果
+    push_audio(chunk): 接收 numpy 音频块
+    set_active(): 控制动画启停
+
+P3 - UI 暗色主题 (gui_theme.py 新文件):
+  COLORS 调色板: 深空蓝背景 + 青色强调色
+  DARK_STYLE: 全局 QSS 样式表
+    圆角卡片, 无边框输入框, 渐变按钮
+  apply_theme(app): 一键应用主题
+  qfluentwidgets 优雅降级:
+    已安装 -> 使用 FluentPushButton 等组件
+    未安装 -> 使用 QSS 样式的原生组件
+
+  gui.py 集成:
+    波形控件替代 AudioLevelWidget
+    RecognizeThread 新增 chunk_ready 信号
+    chunk_ready -> waveform.push_audio 实时推送
+    main() 中 apply_theme(app) 应用暗色主题
+----------------------------------------
+[2026-05-27] 毛玻璃 UI + 脉冲动效 + 现代暗色主题
+----------------------------------------
+
+新增文件:
+  gui_widgets.py:
+    AcrylicCard: 毛玻璃卡片容器
+      半透明深色亚克力背景 rgba(20,25,35,180)
+      15px 圆角, 无实线边框
+      QGraphicsDropShadowEffect (blur=25, offset=6)
+    ListeningWidget: 科技感脉冲呼吸球
+      中心圆 + mic.png 图标
+      2 层涟漪光环 (cyan #00F0FF + purple #B537F2)
+      半径周期性扩散, 透明度 150->0 渐隐
+      ~30fps QTimer + QPainter 抗锯齿
+      start_animation() / stop_animation()
+
+  gui_theme.py:
+    COLORS 调色板: 深空蓝 + 青色强调
+    MODERN_STYLE QSS:
+      扁平按钮: #1e293b -> hover #2563eb -> pressed #1d4ed8
+      极简输入框: 无边框, focus 时底边荧光青
+      字体: Microsoft YaHei / Segoe UI / PingFang SC
+      标题 16px 加粗, 正文 13px, 灰白 #e2e8f0
+
+修改文件:
+  gui.py:
+    无边框窗口: FramelessWindowHint + WA_TranslucentBackground
+    bg.jpg 流体背景: KeepAspectRatioByExpanding 自适应缩放
+    深色半透明覆盖层 rgba(10,10,26,160) 保证可读性
+    拖拽移动: mousePressEvent/MoveEvent
+    关闭/最小化按钮 (右上角)
+    ListeningWidget 替代旧的按钮+AudioLevelWidget
+    实时波形: chunk_ready -> waveform.push_audio
+
+  gui_login.py:
+    bg.jpg 背景 + ListeningWidget 脉冲球
+    strict_vad 端点检测 -> verify_any_user
+    视觉风格与主界面统一
+----------------------------------------
+[2026-05-27] UI 布局重构 - 修复裁切与遮挡问题
+----------------------------------------
+
+问题描述:
+  1. 大量使用 setFixedSize/setFixedHeight 导致控件尺寸僵化，文本被裁切
+  2. 窗口控制按钮放在语音控制区内，遮挡其他控件
+  3. gui.py 中 _apply_theme() 覆盖全局 DARK_STYLE，样式冲突
+  4. _on_level() 引用不存在的 self.audio_level
+  5. 布局间距不足，组件缺乏呼吸感
+
+修改文件:
+
+  [1] gui.py (布局重构)
+      - 移除所有内部控件的 setFixedSize/setFixedHeight/setFixedWidth
+        例外: 窗口控制按钮保留 setFixedSize(36,28)
+      - 所有按钮/输入框改用 setSizePolicy(Expanding, Fixed)
+      - 窗口控制按钮从语音控制区移至顶部 header 栏
+      - header/footer 改用 setSizePolicy 替代固定高度
+      - 布局间距优化: 面板 15px, 语音控制 12px, 快捷按钮 10px
+      - header/footer 添加 addStretch() 防止组件散架
+      - 删除 _apply_theme() 方法 (冗余样式覆盖)
+      - 修复 _on_level() 移除不存在的 audio_level 引用
+      - 全局字体从 10px 提升到 11px
+
+  gui_theme.py (已在上一轮更新):
+      - 全局 QSS: 正文 14px, 按钮 15px, 组标题 16px
+      - 按钮 min-height 38px, 输入框 min-height 40px
+
+测试结果:
+  - Syntax OK
+  - setFixed 调用仅剩 2 处 (窗口按钮)
+  - 文件行数 913 (从 1012 精简)
+
+----------------------------------------
+[2026-05-27] 智能应用启动器 + ASR 容错优化
+----------------------------------------
+
+问题描述:
+  1. 打开第三方应用 (如网易云音乐) 失败: os.startfile 找不到文件
+     原因: _open_app 仅支持内置 .exe，不搜索已安装应用
+  2. Whisper 幻觉过滤过于严格: 含动词的短指令 (如"锁屏"2字) 被误杀
+     原因: 最小长度检查 (4字) 在动词检查之前，短命令先被拒绝
+
+新增文件:
+
+  [1] controller/app_finder.py (全新模块)
+      - find_app(query): 按名称搜索已安装应用
+        搜索策略 (按优先级):
+        a) Start Menu 快捷方式 (.lnk): 遍历 Programs 目录，
+           用 PowerShell 读取 .lnk 目标路径，按名称相似度匹配
+        b) 桌面快捷方式: 同上
+        c) Windows 注册表: 遍历 HKLM Uninstall 键，
+           匹配 DisplayName，查找 InstallLocation 中的 .exe
+        d) 相似度阈值: shortcuts >= 0.4, registry >= 0.5, best >= 0.4
+      - 返回 (exe_path, matched_name, score) 或 None
+
+修改文件:
+
+  [2] controller/system_controller.py
+      - _open_app() 重写:
+        快速路径: 内置 Windows 工具 (记事本/计算器等) 直接执行
+        新增: 调用 find_app() 搜索 Start Menu / 注册表 / 桌面
+        找到后 subprocess.Popen(exe_path) 启动
+        降级: 直接执行名称 -> .exe 后缀 -> cmd /c start
+      - 新增 import: from controller.app_finder import find_app
+
+  [3] asr/speech_recognizer.py
+      - _remove_hallucination() 优化:
+        动词检查提前到长度检查之前
+        最小长度改为动态: 有动词 -> 2字, 无动词 -> 4字
+        效果: "锁屏"(2字含动词) 不再被误杀
+        幻觉 (无动词) 仍然被正确拒绝
+
+测试预期:
+  - "打开网易云音乐" -> find_app 搜索快捷方式/注册表 -> 找到并启动
+  - "打开记事本" -> 内置映射 -> notepad.exe
+  - "锁屏" -> 2字含动词 -> 通过过滤 -> 匹配 lock_screen
+  - "把开近适的。" -> 无动词 -> 拒绝 (幻觉)
+
+----------------------------------------
+[2026-05-27] 快捷方式扫描启动器 (简化版)
+----------------------------------------
+
+重写 _open_app 启动逻辑，用快捷方式扫描替代复杂搜索:
+
+  controller/system_controller.py:
+    新增 _find_and_open_shortcut(self, app_name):
+      扫描 4 个 Windows 标准快捷方式目录 (含子目录):
+        1. 用户桌面 (~\Desktop)
+        2. 公共桌面 (%PUBLIC%\Desktop)
+        3. 用户开始菜单 (~\AppData\Roaming\...\Start Menu\Programs)
+        4. 全局开始菜单 (%PROGRAMDATA%\...\Start Menu\Programs)
+      匹配逻辑: app_name 存在于 .lnk 文件名中 (忽略大小写)
+      找到后 os.startfile(shortcut_path) 直接打开快捷方式
+      返回 (True, matched_filename) 或 (False, None)
+
+    _open_app() 策略:
+      1. 内置工具 (记事本/计算器等) -> os.startfile(exe)
+      2. _find_and_open_shortcut() 扫描快捷方式
+      3. 直接执行 name / name.exe
+      4. cmd /c start 兜底
+
+    移除: app_finder.py 的 import (不再需要注册表搜索)
+
+测试预期:
+  "打开网易云音乐" -> 扫描桌面/开始菜单 -> 找到"网易云音乐.lnk" -> os.startfile 打开
+  "打开记事本" -> 内置映射 -> os.startfile("notepad.exe")
+
+----------------------------------------
+[2026-05-27] 动态白名单 + 自适应阈值 + Whisper small 升级
+----------------------------------------
+
+P1 - 动态应用白名单:
+  controller/command_parser.py:
+    新增 inject_apps(app_names): 批量注入应用名到 SUPPORTED_APPS 并重建拼音索引
+  controller/system_controller.py:
+    新增 _scan_installed_apps(): 扫描桌面/开始菜单所有 .lnk 文件名
+      去掉 .lnk 后缀, 清理括号内容和版本号, 返回 >= 2字 的名称列表
+    __init__ 中自动调用: scan -> inject_apps -> 白名单动态扩展
+    效果: 桌面有"豆包.lnk" -> SUPPORTED_APPS 自动包含"豆包"
+
+P2 - 自适应拼音阈值:
+  controller/command_parser.py:
+    _validate_app_name() 阈值改为按目标应用名长度自适应:
+      <= 2字 (如"豆包"):  >= 0.85 (严格, 防误匹配)
+      <= 3字:             >= 0.75 (中等)
+      >= 4字 (如"网易云音乐"): >= 0.60 (宽松, Whisper长句易出错)
+    原固定 0.75 -> 现在自适应
+
+P3 - Whisper 模型升级:
+  config.yaml + global_config.py:
+    model_size: base -> small (更大模型, 中文 CER 更低)
+  asr/speech_recognizer.py:
+    _transcribe_faster(): 新增 repetition_penalty=1.2
+    _transcribe_openai(): 新增 repetition_penalty=1.2
+    效果: 抑制叠词幻觉 (如"炉炉"), 提升识别准确率
+
+----------------------------------------
+[2026-05-27] HuggingFace 镜像源注入 + 下载超时保护
+----------------------------------------
+
+问题: Whisper small 模型下载连接 HuggingFace Hub 超时 (国内网络)
+
+修改文件:
+
+  [1] gui.py (入口)
+      最顶部 (import os 之后, 其他 import 之前):
+        os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+        os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+        os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "60"
+        print("[I][system] HF_ENDPOINT -> hf-mirror.com")
+      确保在所有 HF/huggingface_hub 导入之前生效
+
+  [2] main.py (另一入口)
+      同上, 最顶部注入 HF_ENDPOINT
+
+  [3] asr/speech_recognizer.py (安全网)
+      import os 之后, global_config 导入之前:
+        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+        os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
+      使用 setdefault 避免覆盖已设值
+      即使作为独立模块导入也能走镜像
+
+  [4] global_config.py (已有, 保留)
+      原有 HF_ENDPOINT 设置不变, 作为兜底
+
+  HF_HUB_DOWNLOAD_TIMEOUT=60: 单次下载超时 60 秒, 防止假死
+
+----------------------------------------
+[2026-05-27] APP_PATH_MAP + 模糊匹配 + 快捷方式路径扫描
+----------------------------------------
+
+  controller/system_controller.py:
+    _scan_installed_apps() 重写:
+      返回 {app_name: shortcut_path} 字典 (不再是纯名称列表)
+      扫描 4 个目录: 用户桌面、公共桌面、用户开始菜单、全局开始菜单
+      清理名称: 去 .lnk 后缀, 去括号内容
+    self.app_path_map: 实例属性, 存储扫描结果
+    __init__: scan -> inject_apps(names, path_map) 注入解析器
+    _open_app() 重写:
+      1. 内置工具快速路径
+      2. app_path_map 直接查找 (精确)
+      3. difflib.get_close_matches 模糊匹配 (cutoff=0.6)
+      4. cmd /c start 兜底
+    效果: "打开网易云音乐" -> 扫描到快捷方式 -> os.startfile(.lnk)
+
+  controller/command_parser.py:
+    APP_PATH_MAP: 模块级全局字典, 由 inject_apps 填充
+    inject_apps(app_names, path_map): 接收路径字典并存储
+    _validate_app_name() 新增模糊兜底:
+      拼音匹配失败后, 用 difflib.get_close_matches(text, SUPPORTED_APPS, cutoff=0.6)
+      处理 Whisper 错字: "鸡死本" -> get_close_matches -> "记事本"
