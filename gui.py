@@ -48,6 +48,7 @@ from gui_waveform import WaveformWidget
 from gui_theme import COLORS, DARK_STYLE, apply_theme
 from gui_widgets import AcrylicCard, ListeningWidget
 from global_config import SAMPLE_RATE
+from audio.dynamic_sampler import DynamicAudioSampler
 
 
 # COLORS imported from gui_theme.py
@@ -198,7 +199,7 @@ class RecognizeThread(QThread):
     def _get_speech_threshold(self):
         """Adaptive speech threshold based on ambient noise."""
         # Threshold = ambient * multiplier, with minimum floor
-        return max(self._ambient_rms * 3.0, 0.001)
+        return max(self._ambient_rms * 4.5, 0.002)
 
     def run(self):
         # Calibrate ambient noise before starting
@@ -253,8 +254,6 @@ class RecognizeThread(QThread):
 
                 self.status_update.emit("processing")
                 processed = self.preprocessor.process(speech_audio)
-                if len(processed) < SAMPLE_RATE * 0.2:
-                    processed = self.preprocessor.process(speech_audio, use_spectral_subtraction=False)
 
                 start = time.time()
                 text = self.recognizer.transcribe(processed)
@@ -314,6 +313,7 @@ class MainWindow(QMainWindow):
         self.current_user = None
         self.command_history = deque(maxlen=100)
         self._components_loaded = True
+        self.dynamic_sampler = DynamicAudioSampler(samples_per_enroll=3)
         self._init_ui()
 
     def _load_bg(self):
@@ -828,7 +828,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "组件加载中，请稍候...")
             return
         if not self.verifier or self.verifier.model is None:
-            QMessageBox.warning(self, "提示", "声纹模型未加载，无法注册用户。\n请确认已安装 speechbrain 库。")
+            QMessageBox.warning(self, "提示", "声纹模型未加载，无法注册用户。\\n请确认已安装 speechbrain 库。")
             return
         user_id = self.user_combo.currentText().strip()
         if not user_id:
@@ -842,27 +842,37 @@ class MainWindow(QMainWindow):
         timestamp = time.strftime("%H:%M:%S")
         self._log(f"<span style='color:{COLORS['text_muted']}'>[{timestamp}]</span> "
                   f"<span style='color:{COLORS['gradient_start']}'>开始注册: {user_id}</span>")
+
+        # DynamicAudioSampler
+        prompts = self.dynamic_sampler.get_prompts(count=3)
         samples = []
-        for i in range(3):
-            self._log(f"  采样 {i+1}/3 - 请说话 (3秒)...")
-            self.status_text.setText(f"注册采样 {i+1}/3...")
+        for i, prompt_info in enumerate(prompts):
+            prompt_text = prompt_info["text"]
+            duration = prompt_info["duration"]
+            countdown_str = self.dynamic_sampler.format_countdown(duration)
+            self._log(
+                f"  <span style='color:{COLORS['text_muted']}'>采样 {i+1}/3</span> | "
+                f"<span style='color:#00E5FF'>请朗读: {prompt_text}</span> | "
+                f"<span style='color:{COLORS['gradient_start']}'>录音 {countdown_str}</span>"
+            )
+            self.status_text.setText(f"注册采样 {i+1}/3 - 请朗读提示词...")
             QApplication.processEvents()
-            raw = self.capture.record_seconds(3)
+            raw = self.capture.record_seconds(duration)
             processed = self.preprocessor.process(raw)
             if len(processed) > SAMPLE_RATE * 0.5:
                 samples.append(processed)
-                self._log(f"  <span style='color:{COLORS['success']}'>采样 {i+1} 完成</span>")
+                self._log(f"  <span style='color:{COLORS['success']}'>✓ 采样 {i+1} 完成 (时长 {duration:.1f}s)</span>")
             else:
-                self._log(f"  <span style='color:{COLORS['warning']}'>采样 {i+1} 无效</span>")
+                self._log(f"  <span style='color:{COLORS['warning']}'>✗ 采样 {i+1} 无效，录音过短</span>")
+
         success = self.verifier.register_speaker(user_id, samples)
         if success:
-            self._log(f"  <span style='color:{COLORS['success']}'>✓ 注册成功: {user_id}</span>")
+            self._log(f"  <span style='color:{COLORS['success']}'>✓ 注册成功: {user_id} (有效样本 {len(samples)}/{len(prompts)})</span>")
             self._refresh_user_list()
         else:
             self._log(f"  <span style='color:{COLORS['error']}'>✗ 注册失败: {user_id}</span>")
         self.status_text.setText("就绪")
         self._update_info_display()
-
     def _log(self, html):
         self.log_display.append(html)
 

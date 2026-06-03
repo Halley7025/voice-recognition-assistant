@@ -1,25 +1,379 @@
+"""Audio preprocessing with Silero VAD and linear peak normalization.
+
+Pipeline: Silero VAD -> speech extraction -> peak normalization -> pre-emphasis.
+
+Key design principles:
+  - No non-linear transforms (no tanh, no spectral subtraction)
+  - Silero VAD (ONNX) for precise speech endpoint detection
+  - Linear peak normalization preserves transient fidelity
+  - All operations in-memory, zero disk I/O
+"""
+import os
 import numpy as np
-import scipy.signal as signal
 from logger_config import setup_logger
 _log = setup_logger(__name__)
+
 from global_config import (
     SAMPLE_RATE, PRE_EMPHASIS_COEFF, FRAME_LENGTH_MS,
     FRAME_SHIFT_MS, FFT_SIZE, VAD_ENERGY_THRESHOLD
 )
 
+# Silero VAD model path (bundled with faster-whisper)
+_SILERO_VAD_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "models", "silero_vad.onnx"
+)
+# Fallback: faster-whisper ships silero_vad_v6.onnx
+_FW_SILERO_PATH = None
+try:
+    import faster_whisper
+    _fw_dir = os.path.dirname(faster_whisper.__file__)
+    _candidate = os.path.join(_fw_dir, "assets", "silero_vad_v6.onnx")
+    if os.path.isfile(_candidate):
+        _FW_SILERO_PATH = _candidate
+except ImportError:
+    pass
+
 
 class AudioPreprocessor:
+    """Audio preprocessor with Silero VAD and linear peak normalization.
+
+    Replaces legacy AGC (tanh) + spectral subtraction with:
+      1. Silero VAD (ONNX, CPU, ~ms latency) for precise endpoint detection
+      2. Linear peak normalization (target peak = 0.7) for safe gain
+      3. Pre-emphasis filter (optional, for ASR compatibility)
+
+    Attributes:
+        sample_rate: Audio sample rate (default 16000).
+        frame_length: Frame length in samples (for legacy compatibility).
+        frame_shift: Frame shift in samples (for legacy compatibility).
+    """
+
+    # Chunk size for Silero VAD v6 (fixed by model architecture)
+    _SILERO_CHUNK_SIZE = 576
+
     def __init__(self, sample_rate=SAMPLE_RATE):
         self.sample_rate = sample_rate
         self.frame_length = int(FRAME_LENGTH_MS * sample_rate / 1000)
         self.frame_shift = int(FRAME_SHIFT_MS * sample_rate / 1000)
-        self.noise_estimate = None
-        self.noise_frames = 0
         self._mel_basis_cache = {}
 
+        # Silero VAD state
+        self._silero_session = None
+        self._silero_threshold = 0.55  # Speech probability threshold (raised for precision)
+        self._load_silero_vad()
+
+    def _load_silero_vad(self):
+        """Load Silero VAD ONNX model (try local, then faster-whisper bundled)."""
+        try:
+            import onnxruntime as ort
+            # Priority: local model > faster-whisper bundled
+            for candidate in [_SILERO_VAD_PATH, _FW_SILERO_PATH]:
+                if candidate and os.path.isfile(candidate):
+                    self._silero_session = ort.InferenceSession(
+                        candidate, providers=["CPUExecutionProvider"]
+                    )
+                    _log.info(f"Silero VAD loaded: {os.path.basename(candidate)}")
+                    return
+            _log.warning("Silero VAD model not found, falling back to energy VAD")
+        except Exception as e:
+            _log.warning(f"Silero VAD load failed: {e}, falling back to energy VAD")
+
+    # ------------------------------------------------------------------
+    # Core: Silero VAD speech detection
+    # ------------------------------------------------------------------
+    def get_speech_timestamps(self, audio, threshold=None, min_speech_ms=250,
+                              min_silence_ms=100):
+        """Detect speech segments using Silero VAD (ONNX).
+
+        Scans audio in 576-sample chunks, queries the neural VAD model
+        for per-chunk speech probability, then merges contiguous speech
+        regions.
+
+        Args:
+            audio: float32 numpy array, 16kHz mono.
+            threshold: speech probability threshold (default 0.5).
+            min_speech_ms: minimum speech segment duration to keep.
+            min_silence_ms: minimum silence gap to split segments.
+
+        Returns:
+            List of dicts: [{"start": sample_idx, "end": sample_idx}, ...]
+            Empty list if no speech detected.
+        """
+        if threshold is None:
+            threshold = self._silero_threshold
+
+        # Fallback to energy-based VAD if Silero not available
+        if self._silero_session is None:
+            return self._energy_vad_timestamps(audio, threshold)
+
+        chunk_size = self._SILERO_CHUNK_SIZE
+        # Pad audio to multiple of chunk_size
+        n_chunks = len(audio) // chunk_size
+        if n_chunks == 0:
+            return []
+
+        # Reshape into [n_chunks, chunk_size]
+        chunks = audio[:n_chunks * chunk_size].reshape(n_chunks, chunk_size).copy()
+
+        # Run inference with hidden state carry-over
+        h = np.zeros((1, 1, 128), dtype=np.float32)
+        c = np.zeros((1, 1, 128), dtype=np.float32)
+        probs = np.zeros(n_chunks, dtype=np.float32)
+
+        # Process in batches to avoid memory spikes (batch_size=512 chunks = ~18s)
+        batch_size = 512
+        for i in range(0, n_chunks, batch_size):
+            batch = chunks[i:i + batch_size]
+            out, h, c = self._silero_session.run(
+                None, {"input": batch, "h": h, "c": c}
+            )
+            probs[i:i + len(batch)] = out[:len(batch)]
+
+        # Build binary speech mask from probabilities
+        speech_mask = probs >= threshold
+
+        # Merge contiguous speech regions
+        min_speech_chunks = max(1, int(min_speech_ms / 1000 * self.sample_rate / chunk_size))
+        min_silence_chunks = max(1, int(min_silence_ms / 1000 * self.sample_rate / chunk_size))
+
+        segments = []
+        in_speech = False
+        seg_start = 0
+        silence_count = 0
+
+        for i in range(n_chunks):
+            if speech_mask[i]:
+                if not in_speech:
+                    seg_start = i
+                    in_speech = True
+                silence_count = 0
+            else:
+                if in_speech:
+                    silence_count += 1
+                    if silence_count >= min_silence_chunks:
+                        seg_end = i - silence_count + 1
+                        if seg_end - seg_start >= min_speech_chunks:
+                            segments.append({
+                                "start": seg_start * chunk_size,
+                                "end": seg_end * chunk_size
+                            })
+                        in_speech = False
+                        silence_count = 0
+
+        # Handle trailing speech
+        if in_speech:
+            seg_end = n_chunks
+            if seg_end - seg_start >= min_speech_chunks:
+                segments.append({
+                    "start": seg_start * chunk_size,
+                    "end": seg_end * chunk_size
+                })
+
+        return segments
+
+    def _energy_vad_timestamps(self, audio, threshold):
+        """Fallback: energy-based VAD when Silero is unavailable."""
+        frames = self.framing(audio)
+        energy = np.sum(frames ** 2, axis=1)
+        max_e = np.max(energy) if len(energy) > 0 else 1.0
+        if max_e <= 0:
+            return []
+        norm_e = energy / max_e
+        mask = norm_e > max(threshold * 0.1, 0.01)
+
+        segments = []
+        in_seg = False
+        seg_start = 0
+        for i, m in enumerate(mask):
+            if m and not in_seg:
+                seg_start = i
+                in_seg = True
+            elif not m and in_seg:
+                segments.append({
+                    "start": seg_start * self.frame_shift,
+                    "end": min(i * self.frame_shift + self.frame_length, len(audio))
+                })
+                in_seg = False
+        if in_seg:
+            segments.append({
+                "start": seg_start * self.frame_shift,
+                "end": len(audio)
+            })
+        return segments
+
+    # ------------------------------------------------------------------
+    # Core: linear peak normalization
+    # ------------------------------------------------------------------
+    @staticmethod
+    def peak_normalize(audio, target_peak=0.7):
+        """Linear peak normalization: scale audio so max |sample| = target_peak.
+
+        This is a pure linear gain — zero harmonic distortion, zero transient
+        smearing. Preserves all spectral content including plosive consonants.
+
+        Args:
+            audio: float32 numpy array.
+            target_peak: desired absolute peak value (default 0.7, approx -3dBFS).
+
+        Returns:
+            Normalized audio (float32). Returns original if silent.
+        """
+        peak = np.max(np.abs(audio))
+        if peak < 1e-8:
+            return audio
+        return (audio * (target_peak / peak)).astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Strict VAD (wraps Silero VAD for gui.py / gui_login.py)
+    # ------------------------------------------------------------------
+    def strict_vad(self, audio, energy_threshold=0.005, snr_threshold=6.0,
+                   min_speech_sec=0.5):
+        """Strict VAD using Silero VAD + energy/SNR checks.
+
+        Compatible with old interface: returns (is_valid, speech_audio, meta).
+        """
+        if len(audio) < self.sample_rate * 0.3:
+            return False, audio, {"reason": "too_short"}
+
+        overall_rms = np.sqrt(np.mean(audio ** 2))
+
+        # Use Silero VAD to find speech segments
+        segments = self.get_speech_timestamps(audio, threshold=0.55)
+
+        if not segments:
+            # No speech detected by Silero → check pure energy as last resort
+            if overall_rms < energy_threshold:
+                return False, audio, {"reason": "silence", "rms": overall_rms}
+            return False, audio, {"reason": "no_speech_detected"}
+
+        # Calculate total speech duration
+        total_speech_samples = sum(s["end"] - s["start"] for s in segments)
+        speech_duration = total_speech_samples / self.sample_rate
+
+        if speech_duration < min_speech_sec:
+            return False, audio, {
+                "reason": "speech_too_short",
+                "speech_duration": speech_duration
+            }
+
+        # Extract speech with padding
+        speech_audio = self.extract_speech(audio, segments, pad_ms=200)
+
+        _log.info(
+            f"VAD通过: RMS={overall_rms:.4f} 语音={speech_duration:.2f}s 段数={len(segments)}"
+        )
+        return True, speech_audio, {
+            "reason": "accepted",
+            "speech_duration": speech_duration,
+            "segments": len(segments)
+        }
+
+    # ------------------------------------------------------------------
+    # Speech extraction with padding
+    # ------------------------------------------------------------------
+    def extract_speech(self, audio, segments=None, pad_ms=200):
+        """Extract speech segments from audio with configurable padding.
+
+        Args:
+            audio: float32 numpy array.
+            segments: list of {start, end} dicts (from get_speech_timestamps).
+                      If None, runs get_speech_timestamps first.
+            pad_ms: padding in milliseconds before/after each segment.
+
+        Returns:
+            Concatenated speech audio (float32). Returns original if no segments.
+        """
+        if segments is None:
+            segments = self.get_speech_timestamps(audio)
+        if not segments:
+            return audio
+
+        pad_samples = int(pad_ms * self.sample_rate / 1000)
+        chunks = []
+        for seg in segments:
+            start = max(0, seg["start"] - pad_samples)
+            end = min(len(audio), seg["end"] + pad_samples)
+            chunks.append(audio[start:end])
+
+        if not chunks:
+            return audio
+        return np.concatenate(chunks)
+
+    # ------------------------------------------------------------------
+    # Soft spectral gate noise reduction
+    # ------------------------------------------------------------------
+    def denoise(self, audio, gate_floor=0.02, frame_ms=20):
+        """Soft spectral gate noise reduction.
+
+        Uses scipy.signal.stft/istft for robust STFT reconstruction,
+        with a Wiener-style gain mask estimated from quiet frames.
+
+        Args:
+            audio: float32 mono, 16kHz.
+            gate_floor: minimum gain (0.02 = -34dB max attenuation).
+            frame_ms: frame size in ms.
+
+        Returns:
+            Denoised audio (float32, same length).
+        """
+        if len(audio) < self.frame_length * 2:
+            return audio
+
+        try:
+            from scipy.signal import stft, istft
+        except ImportError:
+            return audio
+
+        nperseg = 512
+        noverlap = nperseg - int(frame_ms * self.sample_rate / 1000)  # ~320 step
+
+        # STFT
+        f, t_stft, Zxx = stft(audio, fs=self.sample_rate,
+                               nperseg=nperseg, noverlap=noverlap,
+                               window='hann', padded=True)
+
+        magnitude = np.abs(Zxx).astype(np.float32)
+        phase = np.angle(Zxx).astype(np.float32)
+        power = magnitude ** 2
+
+        # Estimate noise from quietest 20% of frames
+        frame_energy = np.sum(power, axis=0)
+        n_quiet = max(1, len(frame_energy) // 5)
+        quiet_idx = np.argsort(frame_energy)[:n_quiet]
+        noise_power = np.mean(power[:, quiet_idx], axis=1, keepdims=True).astype(np.float32)
+
+        # Wiener gain: G = max(1 - noise/signal, floor)
+        gain = np.maximum(1.0 - noise_power / np.maximum(power, 1e-10), gate_floor)
+
+        # Temporal smoothing (suppress musical noise artifacts)
+        from scipy.ndimage import uniform_filter1d
+        gain = uniform_filter1d(gain, size=3, axis=1).astype(np.float32)
+
+        # Apply gain and reconstruct
+        clean_Zxx = (magnitude * gain) * np.exp(1j * phase)
+        _, clean_audio = istft(clean_Zxx, fs=self.sample_rate,
+                                nperseg=nperseg, noverlap=noverlap,
+                                window='hann')
+
+        # Match length
+        if len(clean_audio) > len(audio):
+            clean_audio = clean_audio[:len(audio)]
+        elif len(clean_audio) < len(audio):
+            clean_audio = np.pad(clean_audio, (0, len(audio) - len(clean_audio)))
+
+        return clean_audio.astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Pre-emphasis (kept for ASR compatibility)
+    # ------------------------------------------------------------------
     def pre_emphasis(self, audio: np.ndarray, coeff: float = PRE_EMPHASIS_COEFF) -> np.ndarray:
+        """Pre-emphasis filter: y[n] = x[n] - coeff * x[n-1]."""
         return np.append(audio[0], audio[1:] - coeff * audio[:-1])
 
+    # ------------------------------------------------------------------
+    # Legacy compatibility (framing, windowing, normalize, mel)
+    # ------------------------------------------------------------------
     def framing(self, audio: np.ndarray) -> np.ndarray:
         num_frames = 1 + (len(audio) - self.frame_length) // self.frame_shift
         indices = (
@@ -30,77 +384,35 @@ class AudioPreprocessor:
         return audio[indices]
 
     def windowing(self, frames):
-        hamming = np.hamming(self.frame_length)
-        return frames * hamming
+        return frames * np.hamming(self.frame_length)
 
+    def normalize(self, audio):
+        """Legacy normalize (peak = 0.95). Prefer peak_normalize for new code."""
+        return self.peak_normalize(audio, target_peak=0.95)
+
+    # ------------------------------------------------------------------
+    # Deprecated: kept as no-ops for backward compatibility
+    # ------------------------------------------------------------------
     def auto_gain_control(self, audio: np.ndarray, target_rms: float = 0.1) -> np.ndarray:
-        """RMS-based automatic gain control with soft clipping (tanh compression).
-
-        Boosts quiet signals to target_rms while preventing hard clipping.
-        Uses tanh for smooth saturation instead of hard cutoff.
-        """
-        rms = np.sqrt(np.mean(audio ** 2))
-        if rms < 1e-8:
-            return audio
-
-        # Step 1: Linear gain to reach target RMS
-        gain = target_rms / rms
-        # Cap gain to prevent extreme amplification of pure noise
-        gain = min(gain, 50.0)
-        audio = audio * gain
-
-        # Step 2: Soft clipping via tanh compression
-        # Prevents harsh clipping distortion that destroys consonants
-        peak = np.max(np.abs(audio))
-        if peak > 0.95:
-            # tanh compression: maps (-inf, +inf) -> (-1, +1) smoothly
-            # Scale so that peaks near 1.0 map to ~0.95
-            audio = np.tanh(audio * 1.2) * 0.95
-
-        return audio
+        """DEPRECATED: replaced by peak_normalize. Returns audio unchanged."""
+        _log.debug("auto_gain_control called but is deprecated; using peak_normalize")
+        return self.peak_normalize(audio, target_peak=0.7)
 
     def spectral_subtraction(self, audio, alpha=1.0, beta=0.05):
-        stft = np.fft.rfft(audio)
-        magnitude = np.abs(stft)
-        phase = np.angle(stft)
-        if self.noise_estimate is None or self.noise_frames < 3:
-            noise_mag = magnitude * 0.05
-        else:
-            if len(self.noise_estimate) != len(magnitude):
-                from scipy.signal import resample
-                self.noise_estimate = resample(self.noise_estimate, len(magnitude)).clip(min=0)
-            noise_mag = self.noise_estimate
-        clean_mag = magnitude - alpha * noise_mag
-        clean_mag = np.maximum(clean_mag, beta * magnitude)
-        clean_stft = clean_mag * np.exp(1j * phase)
-        return np.fft.irfft(clean_stft, n=len(audio))
+        """DEPRECATED: removed. Returns audio unchanged."""
+        _log.debug("spectral_subtraction called but is deprecated (removed)")
+        return audio
 
     def update_noise_estimate(self, audio, n_fft=None):
-        if n_fft is not None:
-            stft = np.fft.rfft(audio, n=n_fft)
-        else:
-            stft = np.fft.rfft(audio)
-        magnitude = np.abs(stft)
-        if self.noise_estimate is None:
-            self.noise_estimate = magnitude.copy()
-        else:
-            if len(self.noise_estimate) == len(magnitude):
-                self.noise_estimate = 0.9 * self.noise_estimate + 0.1 * magnitude
-            else:
-                self.noise_estimate = magnitude.copy()
-        self.noise_frames += 1
+        """DEPRECATED: removed. No-op."""
+        pass
 
     def wiener_filter(self, audio, noise_power=None):
-        stft = np.fft.rfft(audio)
-        magnitude = np.abs(stft)
-        power = magnitude ** 2
-        if noise_power is None:
-            noise_power = np.mean(power) * 0.1
-        gain = np.maximum(power - noise_power, 0) / np.maximum(power, 1e-10)
-        clean_stft = gain * stft
-        return np.fft.irfft(clean_stft, n=len(audio))
+        """DEPRECATED: removed. Returns audio unchanged."""
+        return audio
 
     def vad_energy(self, audio):
+        """Legacy energy VAD. Returns boolean mask."""
         frames = self.framing(audio)
         energy = np.sum(frames ** 2, axis=1)
         max_energy = np.max(energy) if len(energy) > 0 else 1.0
@@ -119,158 +431,65 @@ class AudioPreprocessor:
                 expanded_mask[start:end] = True
         return expanded_mask
 
-    def strict_vad(self, audio, energy_threshold=0.005, snr_threshold=6.0,
-                   min_speech_sec=0.5):
-        """Strict VAD: reject audio that is mostly noise or silence.
-
-        Returns:
-            (is_valid, speech_audio, meta) tuple.
-            is_valid: True if audio contains enough speech.
-            speech_audio: trimmed speech portion (or original if valid).
-            meta: dict with diagnostic info.
-        """
-        if len(audio) < self.sample_rate * 0.3:
-            return False, audio, {"reason": "too_short", "duration": len(audio)/self.sample_rate}
-
-        # Frame-level analysis
-        frames = self.framing(audio)
-        frame_energy = np.sum(frames ** 2, axis=1)
-
-        # Estimate noise floor from quietest 15% of frames
-        n_noise = max(1, len(frame_energy) // 7)
-        noise_idx = np.argsort(frame_energy)[:n_noise]
-        noise_floor = np.mean(frame_energy[noise_idx])
-
-        # Signal level from loudest 20% of frames
-        n_signal = max(1, len(frame_energy) // 5)
-        signal_idx = np.argsort(frame_energy)[-n_signal:]
-        signal_level = np.mean(frame_energy[signal_idx])
-
-        # Overall RMS
-        overall_rms = np.sqrt(np.mean(audio ** 2))
-
-        # SNR estimate
-        if noise_floor > 1e-10:
-            snr = 10 * np.log10(signal_level / noise_floor + 1e-10)
-        else:
-            snr = 40.0  # Very clean signal
-
-        # Speech frame ratio
-        frame_rms = np.sqrt(frame_energy + 1e-10)
-        speech_frames = np.sum(frame_rms > energy_threshold)
-        speech_ratio = speech_frames / len(frame_rms) if len(frame_rms) > 0 else 0
-
-        meta = {
-            "overall_rms": float(overall_rms),
-            "snr_db": float(snr),
-            "speech_ratio": float(speech_ratio),
-            "n_frames": len(frame_rms),
-        }
-
-        # Decision: reject if too quiet
-        if overall_rms < energy_threshold * 0.5:
-            meta["reason"] = "too_quiet"
-            _log.info(f"VAD拒绝: 音量过低 (RMS={overall_rms:.6f})")
-            return False, audio, meta
-
-        # Decision: reject if SNR too low (noise-dominated)
-        if snr < snr_threshold:
-            meta["reason"] = "low_snr"
-            _log.info(f"VAD拒绝: 信噪比过低 (SNR={snr:.1f}dB)")
-            return False, audio, meta
-
-        # Decision: reject if speech ratio too low
-        if speech_ratio < 0.2:
-            meta["reason"] = "low_speech_ratio"
-            _log.info(f"VAD拒绝: 语音比例过低 ({speech_ratio:.1%})")
-            return False, audio, meta
-
-        # Extract speech portion with padding
-        speech_mask = frame_rms > energy_threshold
-        pad_frames = 3  # ~75ms padding
-        expanded = np.zeros(len(audio), dtype=bool)
-        for i, is_speech in enumerate(speech_mask):
-            if is_speech:
-                for j in range(max(0, i - pad_frames), min(len(speech_mask), i + pad_frames + 1)):
-                    start = j * self.frame_shift
-                    end = min(start + self.frame_length, len(audio))
-                    expanded[start:end] = True
-
-        speech_audio = audio[expanded]
-        speech_duration = len(speech_audio) / self.sample_rate
-
-        if speech_duration < min_speech_sec:
-            meta["reason"] = "speech_too_short"
-            meta["speech_duration"] = speech_duration
-            _log.info(f"VAD拒绝: 语音时长过短 ({speech_duration:.2f}s < {min_speech_sec}s)")
-            return False, audio, meta
-
-        meta["reason"] = "accepted"
-        meta["speech_duration"] = speech_duration
-        _log.info(f"VAD通过: RMS={overall_rms:.4f} SNR={snr:.1f}dB 语音={speech_ratio:.1%} 时长={speech_duration:.2f}s")
-        return True, speech_audio, meta
-
     def remove_silence(self, audio, pad_ms=200):
-        mask = self.vad_energy(audio)
-        if np.sum(mask) == 0:
-            return audio
-        pad_samples = int(pad_ms * self.sample_rate / 1000)
-        padded_mask = np.zeros_like(mask)
-        speech_indices = np.where(mask)[0]
-        if len(speech_indices) > 0:
-            start = max(0, speech_indices[0] - pad_samples)
-            end = min(len(mask), speech_indices[-1] + pad_samples + 1)
-            padded_mask[start:end] = True
-        return audio[padded_mask]
+        """Remove silence using Silero VAD + padding."""
+        segments = self.get_speech_timestamps(audio)
+        return self.extract_speech(audio, segments, pad_ms=pad_ms)
 
-    def normalize(self, audio):
-        max_val = np.max(np.abs(audio))
-        if max_val > 0:
-            return audio / max_val * 0.95
-        return audio
-
+    # ------------------------------------------------------------------
+    # Main processing pipelines
+    # ------------------------------------------------------------------
     def process_for_speaker(self, audio_data: np.ndarray) -> np.ndarray:
         """Lightweight preprocessing for speaker verification.
-        Only AGC + normalize, preserves voice characteristics."""
+
+        Only Silero VAD + peak normalization. Preserves voice characteristics.
+        """
         audio = audio_data.astype(np.float32)
-        audio = self.auto_gain_control(audio, target_rms=0.1)
-        audio = self.normalize(audio)
+        # VAD to extract speech
+        segments = self.get_speech_timestamps(audio, threshold=0.55)
+        if segments:
+            audio = self.extract_speech(audio, segments, pad_ms=200)
+        # Linear peak normalization (safe for speaker embeddings)
+        audio = self.peak_normalize(audio, target_peak=0.7)
         return audio
 
     def process(self, audio_data: np.ndarray, use_spectral_subtraction: bool = True) -> np.ndarray:
+        """Full preprocessing pipeline for ASR.
+
+        Pipeline: Silero VAD -> extract speech -> peak normalize -> pre-emphasis.
+
+        Args:
+            audio_data: raw float32 audio.
+            use_spectral_subtraction: ignored (kept for API compat).
+
+        Returns:
+            Processed audio ready for Whisper.
+        """
         audio = audio_data.astype(np.float32)
-        audio = self.auto_gain_control(audio, target_rms=0.1)
-        audio = self.normalize(audio)
-        audio = self.pre_emphasis(audio)
-        if use_spectral_subtraction:
-            full_stft = np.fft.rfft(audio)
-            signal_len = len(audio)
-            if self.noise_estimate is not None and len(audio) >= self.frame_length * 3:
-                frames = self.framing(audio)
-                energy = np.sum(frames ** 2, axis=1)
-                n_quiet = max(1, len(energy) // 7)
-                quiet_idx = np.argsort(energy)[:n_quiet]
-                for idx in quiet_idx:
-                    start = idx * self.frame_shift
-                    end = min(start + self.frame_length, len(audio))
-                    frame_audio = audio[start:end]
-                    if len(frame_audio) >= self.frame_length:
-                        self.update_noise_estimate(frame_audio, n_fft=signal_len)
-            elif self.noise_estimate is None:
-                frames = self.framing(audio) if len(audio) >= self.frame_length else audio.reshape(1, -1)
-                energy = np.sum(frames ** 2, axis=1)
-                if len(energy) > 1:
-                    quiet_idx = np.argmin(energy)
-                    start = quiet_idx * self.frame_shift
-                    end = min(start + self.frame_length, len(audio))
-                    self.update_noise_estimate(audio[start:end], n_fft=signal_len)
-                else:
-                    self.update_noise_estimate(audio[:self.frame_length], n_fft=signal_len)
-            audio = self.spectral_subtraction(audio, alpha=1.0, beta=0.05)
-        audio = self.remove_silence(audio, pad_ms=200)
-        audio = self.normalize(audio)
+
+        # 1. Silero VAD: extract speech segments with padding
+        segments = self.get_speech_timestamps(audio, threshold=0.55)
+        if segments:
+            audio = self.extract_speech(audio, segments, pad_ms=200)
+
+        # 2. Soft spectral gate noise reduction
+        audio = self.denoise(audio, gate_floor=0.02)
+
+        # 3. Linear peak normalization (preserves transients)
+        audio = self.peak_normalize(audio, target_peak=0.7)
+
+        # 3. Pre-emphasis (boost high frequencies for Whisper)
+        if len(audio) > 1:
+            audio = self.pre_emphasis(audio)
+
+        # 4. Final peak normalization (pre-emphasis can shift peak)
+        audio = self.peak_normalize(audio, target_peak=0.7)
+
         return audio
 
+    # ------------------------------------------------------------------
+    # Mel spectrogram (unchanged)
+    # ------------------------------------------------------------------
     def extract_mel_spectrogram(self, audio: np.ndarray, n_mels: int = 80) -> np.ndarray:
         stft = np.abs(np.fft.rfft(
             self.framing(audio) * np.hamming(self.frame_length),

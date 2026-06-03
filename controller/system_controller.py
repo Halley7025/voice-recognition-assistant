@@ -6,6 +6,7 @@ import threading
 import time
 import webbrowser
 from logger_config import setup_logger
+from controller.storage_manager import LocalAppStorageManager
 _log = setup_logger(__name__)
 
 
@@ -13,6 +14,7 @@ class SystemController:
     def __init__(self):
         self.volume_interface = None
         self._last_cmd = None
+        self.storage = LocalAppStorageManager()
         self._init_volume()
         # Build app_path_map by scanning desktop / Start Menu shortcuts
         self.app_path_map = self._scan_installed_apps()
@@ -186,10 +188,10 @@ class SystemController:
         try:
             import pyautogui
             img = pyautogui.screenshot()
-            save_path = os.path.join(os.path.dirname(__file__), "..", "data", "screenshot.png")
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            img.save(save_path)
-            return "截图已保存"
+            saved = self.storage.save_picture(img)
+            if saved:
+                return f"截图已保存: {saved}"
+            return "截图失败: 存储失败"
         except Exception as e:
             return f"截图失败: {e}"
 
