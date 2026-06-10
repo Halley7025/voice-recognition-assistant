@@ -1,4 +1,4 @@
-import re
+﻿import re
 import difflib
 from logger_config import setup_logger
 _log = setup_logger(__name__)
@@ -34,12 +34,84 @@ if _HAS_PYPINYIN:
         _APPS_PINYIN[app] = lazy_pinyin(app, style=Style.NORMAL)
 
 
+# ============================================================
+# PinyinTrie: forward-maximum-match pinyin error correction
+# ============================================================
+class PinyinTrie:
+    """Trie tree for pinyin-based app name correction.
+
+    Each node stores children keyed by pinyin syllable.
+    Leaf / intermediate nodes with is_terminal=True store the
+    canonical Chinese app name so that Whisper fragmented output
+    (e.g. 'wang yi yun yin yue' -> '网易云音乐') can be recovered.
+    """
+
+    __slots__ = ("children", "is_terminal", "canonical")
+
+    def __init__(self):
+        self.children: dict = {}
+        self.is_terminal: bool = False
+        self.canonical: str = ""
+
+    def insert(self, pinyin_list, canonical_name):
+        node = self
+        for py in pinyin_list:
+            key = py.lower()
+            if key not in node.children:
+                node.children[key] = PinyinTrie()
+            node = node.children[key]
+        node.is_terminal = True
+        node.canonical = canonical_name
+
+    def search_forward_max(self, pinyin_list, start_idx):
+        """Greedy forward maximum match starting at start_idx.
+
+        Returns (end_idx, canonical_name) of the longest match found,
+        or (None, None) if no match at all.
+        """
+        node = self
+        best_end = None
+        best_canonical = None
+        for i in range(start_idx, len(pinyin_list)):
+            key = pinyin_list[i].lower()
+            if key not in node.children:
+                break
+            node = node.children[key]
+            if node.is_terminal:
+                best_end = i + 1
+                best_canonical = node.canonical
+        return best_end, best_canonical
+
+
+# Global trie instance, rebuilt on inject_apps()
+_global_trie = None
+
+
+def _build_trie():
+    """Build (or rebuild) the global PinyinTrie from SUPPORTED_APPS."""
+    global _global_trie
+    if not _HAS_PYPINYIN:
+        _global_trie = None
+        return
+    trie = PinyinTrie()
+    for app_name in SUPPORTED_APPS:
+        py_list = lazy_pinyin(app_name, style=Style.NORMAL)
+        if py_list:
+            trie.insert(py_list, app_name)
+    _global_trie = trie
+    _log.info(f"PinyinTrie built: {len(SUPPORTED_APPS)} entries")
+
+
+# Build once at module load
+_build_trie()
+
+
 # Global app path map (populated by SystemController on init)
 APP_PATH_MAP = {}
 
 
 def inject_apps(app_names, path_map=None):
-    """Dynamically add app names to the whitelist and rebuild pinyin index.
+    """Dynamically add app names to the whitelist, rebuild pinyin index and trie.
 
     Args:
         app_names: list of app name strings to add.
@@ -57,6 +129,7 @@ def inject_apps(app_names, path_map=None):
             added += 1
     if added:
         _log.info(f"Whitelist expanded: +{added} apps (total {len(SUPPORTED_APPS)})")
+        _build_trie()  # rebuild trie after whitelist changes
 
 
 # ============================================================
@@ -112,6 +185,35 @@ _PINYIN_MAP = {
     "下一首歌": "media_next", "上一首歌": "media_prev",
     "现在几点了": "get_time", "今天几月几号": "get_date",
 }
+
+
+# ============================================================
+# Verb prefix regex constants for app name body extraction
+# ============================================================
+
+# Narrow mode: matches only verb prefixes, used for fast separation in Trie correction
+_VERB_NARROW_RE = re.compile(
+    r"^(\u6253\u5f00|\u542f\u52a8|\u8fd0\u884c|\u5f00\u542f|\u5173\u95ed|\u9000\u51fa|\u641c\u7d22|\u64ad\u653e|\u6682\u505c|\u505c\u6b62)\s*"
+)
+
+# Wide mode: matches verb phrases with polite prefixes, for fallback app name extraction
+# Handles variants like "帮我打开", "请帮我打开", "我要打开", "给咱打开" etc.
+_VERB_WIDE_RE = re.compile(
+    r"^(?:\u8bf7\s*)?(?:\u5e2e\u6211|\u6211(?:\u8981|\u60f3)|\u54b1(?:\u4eec)?|\u7ed9\u54b1?)?\s*"
+    r"(\u6253\u5f00|\u542f\u52a8|\u8fd0\u884c|\u5f00\u542f|\u5173\u95ed|\u9000\u51fa|\u641c\u7d22|\u64ad\u653e|\u6682\u505c|\u505c\u6b62)\s*"
+)
+
+
+def _extract_app_body(text):
+    if not text:
+        return text, ""
+    m = _VERB_WIDE_RE.match(text)
+    if m:
+        verb = m.group(0).strip()
+        body = text[m.end():].strip()
+        if body:
+            return body, verb
+    return text, ""
 
 
 def _to_pinyin_list(text):
@@ -173,6 +275,35 @@ def _sliding_window_pinyin_match(input_text, target_phrase, threshold=0.8):
                 return True, best_ratio
 
     return False, best_ratio
+
+
+
+def _syllable_edit_distance(py_a, py_b):
+    """计算两个拼音音节列表之间的编辑距离（Levenshtein Distance）。
+
+    注意：此函数在**音节级别**（而非字符串字符级别）操作。
+    例如 ['wang','yi','yun'] 与 ['wang','yi','lin'] 的距离为 1（只需将 'lin' 改为 'yun'），
+    而非按字母逐位计算。
+
+    使用滚动数组优化空间复杂度为 O(min(m,n))。
+    """
+    m, n = len(py_a), len(py_b)
+    # 让较长的序列作为行，减少内存
+    if m < n:
+        return _syllable_edit_distance(py_b, py_a)
+    # dp[j] = py_a[:i] 与 py_b[:j] 的编辑距离
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev = dp[0]
+        dp[0] = i
+        for j in range(1, n + 1):
+            temp = dp[j]
+            if py_a[i - 1].lower() == py_b[j - 1].lower():
+                dp[j] = prev
+            else:
+                dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+            prev = temp
+    return dp[n]
 
 
 def _validate_app_name(extracted_name):
@@ -253,10 +384,185 @@ class CommandParser:
                 self.use_nlu = False
         _log.info(f"Cmd parser ready (pypinyin={_HAS_PYPINYIN}, apps={len(SUPPORTED_APPS)})")
 
+    # ------------------------------------------------------------------
+    # Trie-based pinyin correction (runs BEFORE all other parse strategies)
+    # ------------------------------------------------------------------
+    def _trie_correct(self, text):
+        """Use PinyinTrie forward-maximum-match to replace fragmented
+        Whisper output with canonical app names.
+
+        Example: "拔开网意运因乐" -> pinyin scan finds "wang yi yun yin yue"
+        matches trie node for "网易云音乐" -> replace and return
+        "打开网易云音乐".
+
+        Returns corrected text, or original text if no improvement found.
+        """
+        if not _HAS_PYPINYIN or _global_trie is None:
+            return text
+
+        # Separate leading verb from trailing content
+        verb_match = _VERB_NARROW_RE.match(text)
+        verb = ""
+        body = text
+        if verb_match:
+            verb = verb_match.group(0).strip()
+            body = text[verb_match.end():].strip()
+
+        if not body:
+            return text
+
+        # Build (char, pinyin) pairs for index-safe fallback
+        pairs = []
+        for ch in body:
+            if ch.strip():
+                py = lazy_pinyin(ch, style=Style.NORMAL)
+                if py:
+                    pairs.append((ch, py[0].lower()))
+
+        if len(pairs) < 2:
+            return text
+
+        body_py = [p[1] for p in pairs]
+
+        # Forward maximum match scan through trie
+        corrected_parts = []
+        i = 0
+        matched_any = False
+        while i < len(pairs):
+            end_idx, canonical = _global_trie.search_forward_max(body_py, i)
+            if canonical and (end_idx - i) >= 2:
+                corrected_parts.append(canonical)
+                matched_any = True
+                i = end_idx
+            else:
+                # Keep original character at this position (index-safe)
+                corrected_parts.append(pairs[i][0])
+                i += 1
+
+        if matched_any:
+            corrected_body = "".join(corrected_parts)
+            result = f"{verb}{corrected_body}" if verb else corrected_body
+            if result != text:
+                _log.info(f"Trie correct: '{text}' -> '{result}'")
+            return result
+
+        # Trie 匹配失败，进入拼音音节级编辑距离兜底
+        return self._pinyin_fallback_correct(text, body, verb, pairs)
+
+    def _pinyin_fallback_correct(self, original_text, body, verb, pairs):
+        """Pinyin syllable-level edit distance fallback correction.
+
+        When PinyinTrie forward-maximum-match fails to hit any whitelisted app,
+        this method iterates all known app names, computing syllable-level
+        Levenshtein distance between the input and each standard app name,
+        then selects the best match within a dynamic threshold.
+
+        Core algorithm design (syllable-level edit distance):
+          This edit distance operates at the **syllable level** (not character level).
+          For example, ['wang','yi','yun'] vs ['wang','yi','lin'] has distance 1
+          (just change 'lin' to 'yun'), NOT computed letter-by-letter.
+          This avoids slice alignment issues when pinyin syllable counts differ
+          from the original character count -- we always compare at the atomic
+          syllable unit, regardless of how many letters each Chinese character maps to.
+
+        Dynamic threshold rules:
+          App name length <= 3 chars: max allowed edit distance = 1
+          App name length >= 4 chars: max allowed edit distance = 2
+
+        Tie-breaking: when edit distances are equal, prefer the app name whose
+        character length is closest to the input.
+
+        Args:
+            original_text: full original text (including verb prefix)
+            body: app name body after verb prefix removal
+            verb: extracted verb prefix (e.g. "打开")
+            pairs: (char, pinyin) pair list for index-safe alignment
+        """
+        # ------------------------------------------------------------------
+        # Step 1: Ensure correct app name body extraction
+        # ------------------------------------------------------------------
+        # If the narrow-mode regex failed to capture the verb prefix
+        # (e.g. "帮我打开网易云音了" where "帮我打开" was not stripped),
+        # use the wide-mode regex to re-extract, preventing verb/polite
+        # prefixes from inflating the edit distance.
+        if not verb:
+            extracted_body, extracted_verb = _extract_app_body(original_text)
+            if extracted_verb and extracted_body:
+                body = extracted_body
+                verb = extracted_verb
+                # Rebuild (char, pinyin) pairs from the new body
+                # Process character-by-character to maintain strict alignment
+                # with the original text (not by splitting pinyin strings)
+                pairs = []
+                for ch in body:
+                    if ch.strip():
+                        py = lazy_pinyin(ch, style=Style.NORMAL)
+                        if py:
+                            pairs.append((ch, py[0].lower()))
+
+        if not pairs or not _APPS_PINYIN:
+            return original_text
+
+        input_py = [p[1] for p in pairs]
+        input_char_len = len(pairs)
+
+        # Only enable pinyin edit distance fallback for Chinese input.
+        # Pure English input (like "Word") should not match Chinese app names via pinyin.
+        has_chinese_input = any("\u4e00" <= p[0] <= "\u9fff" for p in pairs)
+        if not has_chinese_input:
+            return original_text
+
+        # ------------------------------------------------------------------
+        # Step 2: Iterate whitelisted apps, compute syllable edit distance
+        # ------------------------------------------------------------------
+        best_app = None
+        best_dist = float("inf")
+        best_len_diff = float("inf")
+
+        for app_name, app_py in _APPS_PINYIN.items():
+            # Skip non-Chinese app names (like Word, Chrome, Excel)
+            # whose short pinyin representations easily cause false matches
+            has_chinese_target = any("\u4e00" <= ch <= "\u9fff" for ch in app_name)
+            if not has_chinese_target:
+                continue
+
+            # Dynamic threshold: based on target app name character count
+            app_char_len = len(app_name)
+            max_allowed = 2 if app_char_len >= 4 else 1
+
+            dist = _syllable_edit_distance(input_py, app_py)
+
+            if dist > max_allowed:
+                continue
+
+            # Select minimum edit distance; on tie, pick closest character length
+            len_diff = abs(input_char_len - app_char_len)
+            if dist < best_dist or (dist == best_dist and len_diff < best_len_diff):
+                best_dist = dist
+                best_app = app_name
+                best_len_diff = len_diff
+
+        # ------------------------------------------------------------------
+        # Step 3: Replace on match, otherwise return original text
+        # ------------------------------------------------------------------
+        if best_app is not None:
+            result = f"{verb}{best_app}" if verb else best_app
+            _log.info(
+                f"PinyinEdit fallback: '{original_text}' -> '{result}' "
+                f"(dist={best_dist}, body='{body}' -> '{best_app}')"
+            )
+            return result
+
+        return original_text
+
+
     def parse(self, text):
         if not text or not text.strip():
             return None
         text = text.strip()
+
+        # 0. Trie-based pinyin correction (pre-processing)
+        text = self._trie_correct(text)
 
         # 1. Exact keyword match
         result = self._exact_match(text)
@@ -391,10 +697,10 @@ class CommandParser:
             if kw in text:
                 if intent is None:
                     has_volume_keyword = True
-                elif kw in ("\u5927", "\u9ad8", "\u589e"):
+                elif kw in ("大", "高", "增"):
                     has_direction_keyword = True
                     direction_intent = intent
-                elif kw in ("\u5c0f", "\u4f4e", "\u51cf"):
+                elif kw in ("小", "低", "减"):
                     has_direction_keyword = True
                     direction_intent = intent
                 else:
@@ -405,3 +711,4 @@ class CommandParser:
             _log.info(f"Semantic combo: '{text}' -> {direction_intent}")
             return direction_intent
         return None
+

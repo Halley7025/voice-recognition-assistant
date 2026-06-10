@@ -48,7 +48,24 @@ class SpeechRecognizer:
         self.temperature = WHISPER_TEMPERATURE
         self.model = None
         self.model_type = None
+        # Hotwords string for biasing Whisper decoder toward known terms
+        self._hotwords = HOTWORDS
         self._load_model()
+
+    def update_hotwords(self, word_list):
+        """Dynamically update hotwords for Whisper decoder biasing.
+
+        Call this after SystemController scans app shortcuts so that
+        app names like "网易云音乐" receive higher acoustic weight
+        during beam search decoding.
+
+        Args:
+            word_list: list of strings (app names + core verbs).
+        """
+        base = HOTWORDS  # keep the base prompt
+        extra = " ".join(w for w in word_list if w and len(w) >= 2)
+        self._hotwords = f"{base} {extra}" if extra else base
+        _log.info(f"Hotwords updated: {len(word_list)} terms, total len={len(self._hotwords)}")
 
     def _load_model(self):
         sizes = [self.model_size]
@@ -60,20 +77,20 @@ class SpeechRecognizer:
             )
             local_model_dir = os.path.join(MODELS_DIR, size)
             strategies = [
-                (f"CTranslate2 HF\u7f13\u5b58({size})", self._try_load_ctranslate2, (hf_cache,)),
-                (f"CTranslate2 \u672c\u5730({size})", self._try_load_ctranslate2, (local_model_dir,)),
+                (f"CTranslate2 HF缓存({size})", self._try_load_ctranslate2, (hf_cache,)),
+                (f"CTranslate2 本地({size})", self._try_load_ctranslate2, (local_model_dir,)),
                 (f"CTranslate2 Hub({size})", self._try_load_ctranslate2_hub, ()),
-                (f"OpenAI Whisper \u672c\u5730({size})", self._try_load_openai_whisper, (local_model_dir,)),
+                (f"OpenAI Whisper 本地({size})", self._try_load_openai_whisper, (local_model_dir,)),
                 (f"OpenAI Whisper Hub({size})", self._try_load_openai_whisper_hub, ()),
             ]
             for name, func, args in strategies:
                 try:
                     if func(*args):
-                        _log.info(f"{name} \u52a0\u8f7d\u6210\u529f ({self.compute_type})")
+                        _log.info(f"{name} 加载成功 ({self.compute_type})")
                         return
                 except Exception as e:
-                    _log.warning(f"{name} \u5931\u8d25: {e}")
-        _log.error("\u6240\u6709\u52a0\u8f7d\u7b56\u7565\u5747\u5931\u8d25")
+                    _log.warning(f"{name} 失败: {e}")
+        _log.error("所有加载策略均失败")
         self.model = None
         self.model_type = None
 
@@ -160,8 +177,8 @@ class SpeechRecognizer:
 
     def transcribe(self, audio_data):
         if self.model is None:
-            return "[\u6a21\u578b\u672a\u52a0\u8f7d]"
-        if len(audio_data) < SAMPLE_RATE * 0.3:
+            return "[模型未加载]"
+        if len(audio_data) < SAMPLE_RATE * 0.2:
             return ""
         audio_float32 = np.asarray(audio_data, dtype=np.float32)
         if audio_float32.size == 0 or np.max(np.abs(audio_float32)) < 1e-7:
@@ -181,21 +198,22 @@ class SpeechRecognizer:
             _log.info(f"'{text}' | {elapsed:.3f}s | RTF={rtf:.3f}")
             return text
         except Exception as e:
-            _log.error(f"\u8bc6\u522b\u9519\u8bef: {e}")
+            _log.error(f"识别错误: {e}")
             return ""
 
     def _transcribe_faster(self, audio_data):
         segments, info = self.model.transcribe(
-            audio_data, language=self.language, beam_size=self.beam_size,
-            temperature=self.temperature, vad_filter=True,
-            initial_prompt=HOTWORDS,
-            vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=300, threshold=0.4),
-            no_speech_threshold=0.6,
+            audio_data, language=self.language, beam_size=1,
+            temperature=0.0, vad_filter=True,
+            initial_prompt=self._hotwords,
+            hotwords=self._hotwords,
+            vad_parameters=dict(min_silence_duration_ms=600, speech_pad_ms=300, threshold=0.3),
+            no_speech_threshold=0.4,
             condition_on_previous_text=False,
             compression_ratio_threshold=2.4,
             log_prob_threshold=-1.0,
             suppress_blank=True, suppress_tokens=[-1],
-            repetition_penalty=1.2,
+            repetition_penalty=1.0,
         )
         return "".join(seg.text.strip() for seg in segments)
 
@@ -204,8 +222,8 @@ class SpeechRecognizer:
         audio_tensor = torch.from_numpy(audio_data).float()
         result = self.model.transcribe(
             audio_tensor, language=self.language, beam_size=self.beam_size,
-            temperature=self.temperature, initial_prompt=HOTWORDS,
-            no_speech_threshold=0.6, condition_on_previous_text=False,
+            temperature=self.temperature, initial_prompt=self._hotwords,
+            no_speech_threshold=0.4, condition_on_previous_text=False,
             compression_ratio_threshold=2.4,
         )
         return result.get("text", "").strip()
@@ -271,7 +289,7 @@ class SpeechRecognizer:
 
         # 4. Remove punctuation and check minimum length
         clean = re.sub(r"[\s\u3000-\u303f\uff00-\uffef.,!?;:\-\(\)\[\]\{}]", "", text)
-        min_len = 2 if has_verb else 4
+        min_len = 2 if has_verb else 3
         if len(clean) < min_len:
             _log.warning(f"HALLUC(too_short): '{text}' -> '{clean}'")
             return ""

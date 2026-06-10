@@ -60,7 +60,8 @@ class AudioPreprocessor:
 
         # Silero VAD state
         self._silero_session = None
-        self._silero_threshold = 0.55  # Speech probability threshold (raised for precision)
+        self._silero_threshold = 0.45  # Speech probability threshold (raised for precision)
+        self._last_max_vad_prob = 0.0  # 最近一次 VAD 扫描的最大语音概率
         self._load_silero_vad()
 
     def _load_silero_vad(self):
@@ -129,6 +130,9 @@ class AudioPreprocessor:
                 None, {"input": batch, "h": h, "c": c}
             )
             probs[i:i + len(batch)] = out[:len(batch)]
+
+        # 记录最大 VAD 概率，供 strict_vad 等上层方法使用
+        self._last_max_vad_prob = float(np.max(probs)) if n_chunks > 0 else 0.0
 
         # Build binary speech mask from probabilities
         speech_mask = probs >= threshold
@@ -228,50 +232,53 @@ class AudioPreprocessor:
     # Strict VAD (wraps Silero VAD for gui.py / gui_login.py)
     # ------------------------------------------------------------------
     def strict_vad(self, audio, energy_threshold=0.005, snr_threshold=6.0,
-                   min_speech_sec=0.5):
-        """Strict VAD using Silero VAD + energy/SNR checks.
+                     min_speech_sec=0.3):
+          """Strict VAD using Silero VAD + energy/SNR checks.
 
-        Compatible with old interface: returns (is_valid, speech_audio, meta).
-        """
-        if len(audio) < self.sample_rate * 0.3:
-            return False, audio, {"reason": "too_short"}
+          Returns (is_valid, speech_audio, meta).
+          meta 始终包含 'max_vad_prob' 字段，表示有效语音段中的最大 VAD 概率值，
+          供上层双重幻觉拦截网进行声学置信度交叉验证。
+          """
+          if len(audio) < self.sample_rate * 0.3:
+              return False, audio, {"reason": "too_short", "max_vad_prob": 0.0}
 
-        overall_rms = np.sqrt(np.mean(audio ** 2))
+          overall_rms = np.sqrt(np.mean(audio ** 2))
 
-        # Use Silero VAD to find speech segments
-        segments = self.get_speech_timestamps(audio, threshold=0.55)
+          # Use Silero VAD to find speech segments
+          # get_speech_timestamps 会将本次扫描的最大 VAD 概率存入 self._last_max_vad_prob
+          segments = self.get_speech_timestamps(audio, threshold=0.45)
+          max_vad_prob = self._last_max_vad_prob
 
-        if not segments:
-            # No speech detected by Silero → check pure energy as last resort
-            if overall_rms < energy_threshold:
-                return False, audio, {"reason": "silence", "rms": overall_rms}
-            return False, audio, {"reason": "no_speech_detected"}
+          if not segments:
+              # No speech detected by Silero → check pure energy as last resort
+              if overall_rms < energy_threshold:
+                  return False, audio, {"reason": "silence", "rms": overall_rms, "max_vad_prob": max_vad_prob}
+              return False, audio, {"reason": "no_speech_detected", "max_vad_prob": max_vad_prob}
 
-        # Calculate total speech duration
-        total_speech_samples = sum(s["end"] - s["start"] for s in segments)
-        speech_duration = total_speech_samples / self.sample_rate
+          # Calculate total speech duration
+          total_speech_samples = sum(s["end"] - s["start"] for s in segments)
+          speech_duration = total_speech_samples / self.sample_rate
 
-        if speech_duration < min_speech_sec:
-            return False, audio, {
-                "reason": "speech_too_short",
-                "speech_duration": speech_duration
-            }
+          if speech_duration < min_speech_sec:
+              return False, audio, {
+                  "reason": "speech_too_short",
+                  "speech_duration": speech_duration,
+                  "max_vad_prob": max_vad_prob
+              }
 
-        # Extract speech with padding
-        speech_audio = self.extract_speech(audio, segments, pad_ms=200)
+          # Extract speech with padding
+          speech_audio = self.extract_speech(audio, segments, pad_ms=400)
 
-        _log.info(
-            f"VAD通过: RMS={overall_rms:.4f} 语音={speech_duration:.2f}s 段数={len(segments)}"
-        )
-        return True, speech_audio, {
-            "reason": "accepted",
-            "speech_duration": speech_duration,
-            "segments": len(segments)
-        }
+          _log.info(
+              f"VAD通过: RMS={overall_rms:.4f} 语音={speech_duration:.2f}s 段数={len(segments)} 最大概率={max_vad_prob:.3f}"
+          )
+          return True, speech_audio, {
+              "reason": "accepted",
+              "speech_duration": speech_duration,
+              "segments": len(segments),
+              "max_vad_prob": max_vad_prob
+          }
 
-    # ------------------------------------------------------------------
-    # Speech extraction with padding
-    # ------------------------------------------------------------------
     def extract_speech(self, audio, segments=None, pad_ms=200):
         """Extract speech segments from audio with configurable padding.
 
@@ -446,7 +453,7 @@ class AudioPreprocessor:
         """
         audio = audio_data.astype(np.float32)
         # VAD to extract speech
-        segments = self.get_speech_timestamps(audio, threshold=0.55)
+        segments = self.get_speech_timestamps(audio, threshold=0.45)
         if segments:
             audio = self.extract_speech(audio, segments, pad_ms=200)
         # Linear peak normalization (safe for speaker embeddings)
@@ -454,36 +461,20 @@ class AudioPreprocessor:
         return audio
 
     def process(self, audio_data: np.ndarray, use_spectral_subtraction: bool = True) -> np.ndarray:
-        """Full preprocessing pipeline for ASR.
+        """Fast preprocessing pipeline for ASR.
 
-        Pipeline: Silero VAD -> extract speech -> peak normalize -> pre-emphasis.
-
-        Args:
-            audio_data: raw float32 audio.
-            use_spectral_subtraction: ignored (kept for API compat).
-
-        Returns:
-            Processed audio ready for Whisper.
+        Pipeline: peak normalize -> pre-emphasis.
+        VAD and speech extraction already done by strict_vad() upstream.
+        Skips denoise (STFT too slow for short commands).
         """
         audio = audio_data.astype(np.float32)
 
-        # 1. Silero VAD: extract speech segments with padding
-        segments = self.get_speech_timestamps(audio, threshold=0.55)
-        if segments:
-            audio = self.extract_speech(audio, segments, pad_ms=200)
-
-        # 2. Soft spectral gate noise reduction
-        audio = self.denoise(audio, gate_floor=0.02)
-
-        # 3. Linear peak normalization (preserves transients)
+        # Peak normalization
         audio = self.peak_normalize(audio, target_peak=0.7)
 
-        # 3. Pre-emphasis (boost high frequencies for Whisper)
+        # Pre-emphasis (boost high frequencies for Whisper)
         if len(audio) > 1:
             audio = self.pre_emphasis(audio)
-
-        # 4. Final peak normalization (pre-emphasis can shift peak)
-        audio = self.peak_normalize(audio, target_peak=0.7)
 
         return audio
 

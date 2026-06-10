@@ -48,6 +48,9 @@ from gui_waveform import WaveformWidget
 from gui_theme import COLORS, DARK_STYLE, apply_theme
 from gui_widgets import AcrylicCard, ListeningWidget
 from global_config import SAMPLE_RATE
+
+# 声学幻觉拦截阈值：当 VAD 最大概率低于此值且语义解析未命中时，判定为幻觉
+SUSPICIOUS_VAD_THRESHOLD = 0.65
 from audio.dynamic_sampler import DynamicAudioSampler
 
 
@@ -169,13 +172,14 @@ class RecognizeThread(QThread):
     level_update = pyqtSignal(float)
     chunk_ready = pyqtSignal(object)
 
-    def __init__(self, capture, preprocessor, recognizer, parser, controller):
+    def __init__(self, capture, preprocessor, recognizer, parser, controller, verifier=None):
         super().__init__()
         self.capture = capture
         self.preprocessor = preprocessor
         self.recognizer = recognizer
         self.parser = parser
         self.controller = controller
+        self.verifier = verifier
         self.running = True
         self._ambient_rms = 0.001  # Initial ambient noise estimate
         self._ambient_samples = 0
@@ -199,7 +203,7 @@ class RecognizeThread(QThread):
     def _get_speech_threshold(self):
         """Adaptive speech threshold based on ambient noise."""
         # Threshold = ambient * multiplier, with minimum floor
-        return max(self._ambient_rms * 4.5, 0.002)
+        return max(self._ambient_rms * 3.5, 0.001)
 
     def run(self):
         # Calibrate ambient noise before starting
@@ -231,7 +235,7 @@ class RecognizeThread(QThread):
                     elif has_speech:
                         if silence_start is None:
                             silence_start = time.time()
-                        elif time.time() - silence_start > 1.5:
+                        elif time.time() - silence_start > 0.7:
                             break
 
                 if not chunks:
@@ -239,13 +243,16 @@ class RecognizeThread(QThread):
                     continue
 
                 raw = np.concatenate(chunks)
-                if not has_speech or len(raw) < SAMPLE_RATE * 0.3:
+                if not has_speech or len(raw) < SAMPLE_RATE * 0.2:
                     self.result_ready.emit("", "未检测到有效语音", 0, None)
                     self.level_update.emit(0.0)
                     continue
 
                 # Strict VAD: reject noise/silence before Whisper
                 vad_valid, speech_audio, vad_meta = self.preprocessor.strict_vad(raw)
+                # 提取声学置信度：Silero VAD 对有效语音段的最大输出概率
+                max_vad_prob = vad_meta.get("max_vad_prob", 0.0)
+
                 if not vad_valid:
                     reason = vad_meta.get("reason", "unknown")
                     self.result_ready.emit("", f"VAD拒绝: {reason}", 0, None)
@@ -264,21 +271,42 @@ class RecognizeThread(QThread):
                     self.level_update.emit(0.0)
                     continue
 
-                cmd = self.parser.parse(text)
-                if cmd:
-                    self.status_update.emit("executing")
-                    # Use verification gate for protected commands
-                    success, result, verified, user_id, sim = verify_and_execute(
-                        cmd, raw, self.verifier, self.controller, self.preprocessor
-                    )
-                    if verified is not None:
-                        if verified:
-                            result = f"[{user_id}验证通过] {result}"
-                        else:
-                            result = f"[声纹验证失败] {result}"
-                    self.result_ready.emit(text, result, elapsed, raw)
-                else:
-                    self.result_ready.emit(text, "未匹配到有效指令", elapsed, raw)
+                # ---- 多指令拆分 ----
+                # 按中文/英文逗号、分号、句号拆分多条指令
+                import re as _re
+                segments = _re.split(r"[,，;；。、]+", text)
+                segments = [s.strip() for s in segments if s.strip()]
+                if not segments:
+                    segments = [text]
+
+                all_results = []
+                any_executed = False
+                for seg_text in segments:
+                    cmd = self.parser.parse(seg_text)
+
+                    # 双重幻觉拦截
+                    if cmd is None and max_vad_prob < SUSPICIOUS_VAD_THRESHOLD:
+                        _log.info(f"[拦截] '{seg_text}' 低置信度({max_vad_prob:.3f})")
+                        all_results.append(f"[拦截] {seg_text}")
+                        continue
+
+                    if cmd:
+                        self.status_update.emit("executing")
+                        success, result, verified, user_id, sim = verify_and_execute(
+                            cmd, raw, self.verifier, self.controller, self.preprocessor
+                        )
+                        if verified is not None:
+                            if verified:
+                                result = f"[{user_id}验证通过] {result}"
+                            else:
+                                result = f"[声纹验证失败] {result}"
+                        all_results.append(f"{seg_text} -> {result}")
+                        any_executed = True
+                    else:
+                        all_results.append(f"{seg_text} -> 未匹配")
+
+                combined = " | ".join(all_results) if all_results else "未匹配到有效指令"
+                self.result_ready.emit(text, combined, elapsed, raw)
 
                 self.level_update.emit(0.0)
             except Exception as e:
@@ -290,6 +318,7 @@ class RecognizeThread(QThread):
 
 
 class MainWindow(QMainWindow):
+    request_logout = pyqtSignal()
     def __init__(self):
         super().__init__()
         self.setWindowTitle("语音识别助手")
@@ -407,6 +436,17 @@ class MainWindow(QMainWindow):
         self.min_btn.setCursor(Qt.PointingHandCursor)
         self.min_btn.clicked.connect(self.showMinimized)
         layout.addWidget(self.min_btn)
+
+        self.logout_btn = QPushButton("切换用户")
+        self.logout_btn.setFixedHeight(28)
+        self.logout_btn.setCursor(Qt.PointingHandCursor)
+        self.logout_btn.setFont(QFont("Microsoft YaHei", 10))
+        self.logout_btn.setStyleSheet(
+            "QPushButton{background:transparent; color:" + COLORS["text_secondary"] + "; border:1px solid " + COLORS["text_muted"] + "; border-radius:6px; padding:2px 12px;}"
+            "QPushButton:hover{color:" + COLORS["text_primary"] + "; border-color:" + COLORS["accent"] + ";}"
+        )
+        self.logout_btn.clicked.connect(self.request_logout.emit)
+        layout.addWidget(self.logout_btn)
 
         self.close_btn = QPushButton("✕")
         self.close_btn.setFixedSize(36, 28)
@@ -693,7 +733,7 @@ class MainWindow(QMainWindow):
     def _start_listening(self):
         self.recognize_thread = RecognizeThread(
             self.capture, self.preprocessor, self.recognizer,
-            self.parser, self.controller
+            self.parser, self.controller, self.verifier
         )
         self.recognize_thread.result_ready.connect(self._on_result)
         self.recognize_thread.status_update.connect(self._on_status)
@@ -918,6 +958,13 @@ def main():
         stack.setCurrentIndex(1)
 
     login_win.login_success.connect(on_login_success)
+
+    def on_request_logout():
+        """切换回登录界面"""
+        login_win.refresh_users()
+        stack.setCurrentIndex(0)
+
+    main_win.request_logout.connect(on_request_logout)
     stack.setCurrentIndex(0)
     stack.show()
     sys.exit(app.exec_())
