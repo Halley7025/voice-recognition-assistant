@@ -1,4 +1,4 @@
-"""Login window with voiceprint verification and enrollment."""
+﻿"""Login window with voiceprint verification and enrollment."""
 import os
 import time
 import numpy as np
@@ -290,16 +290,16 @@ class LoginWindow(QWidget):
         )
 
         self.verify_btn = QPushButton("  \u5f00\u59cb\u58f0\u7eb9\u9a8c\u8bc1")
-        self.verify_btn.setFixedHeight(180)
-        self.verify_btn.setMinimumWidth(700)
+        self.verify_btn.setFixedHeight(126)
+        self.verify_btn.setMinimumWidth(490)
         self.verify_btn.setCursor(Qt.PointingHandCursor)
         self.verify_btn.setStyleSheet(btn_style_grad)
         self.verify_btn.clicked.connect(self._start_verify)
         btn_row.addWidget(self.verify_btn)
 
         self.enroll_btn = QPushButton("  \u6ce8\u518c\u65b0\u7528\u6237")
-        self.enroll_btn.setFixedHeight(180)
-        self.enroll_btn.setMinimumWidth(700)
+        self.enroll_btn.setFixedHeight(126)
+        self.enroll_btn.setMinimumWidth(490)
         self.enroll_btn.setCursor(Qt.PointingHandCursor)
         self.enroll_btn.setStyleSheet(
             "QPushButton {"
