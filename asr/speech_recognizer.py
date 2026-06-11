@@ -1,4 +1,4 @@
-import time
+﻿import time
 import os
 import re
 import numpy as np
@@ -203,17 +203,17 @@ class SpeechRecognizer:
 
     def _transcribe_faster(self, audio_data):
         segments, info = self.model.transcribe(
-            audio_data, language=self.language, beam_size=1,
+            audio_data, language=self.language, beam_size=3,
             temperature=0.0, vad_filter=True,
             initial_prompt=self._hotwords,
             hotwords=self._hotwords,
-            vad_parameters=dict(min_silence_duration_ms=600, speech_pad_ms=300, threshold=0.3),
-            no_speech_threshold=0.4,
+            vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=400, threshold=0.3),
+            no_speech_threshold=0.35,
             condition_on_previous_text=False,
             compression_ratio_threshold=2.4,
-            log_prob_threshold=-1.0,
+            log_prob_threshold=-0.8,
             suppress_blank=True, suppress_tokens=[-1],
-            repetition_penalty=1.0,
+            repetition_penalty=1.1,
         )
         return "".join(seg.text.strip() for seg in segments)
 
@@ -223,7 +223,7 @@ class SpeechRecognizer:
         result = self.model.transcribe(
             audio_tensor, language=self.language, beam_size=self.beam_size,
             temperature=self.temperature, initial_prompt=self._hotwords,
-            no_speech_threshold=0.4, condition_on_previous_text=False,
+            no_speech_threshold=0.35, condition_on_previous_text=False,
             compression_ratio_threshold=2.4,
         )
         return result.get("text", "").strip()

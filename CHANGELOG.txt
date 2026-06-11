@@ -1973,3 +1973,30 @@ P3 - Whisper 模型升级:
       - verify_btn: setMinimumWidth(490) → setFixedWidth(490)
       - enroll_btn: setMinimumWidth(490) → setFixedWidth(490)
       - 窗口宽度由输入框(800px)决定，按钮保持居中不撑满
+
+[2026-06-11] 语音识别准确率与多指令支持优化
+----------------------------------------
+
+问题描述:
+  单条指令识别率不够高，多指令场景（如"打开A,打开B,打开C"）出错率更高。
+  主要原因: beam_size=1 贪心解码精度低、静音截断太早、音频信噪比不足。
+
+修改文件及内容:
+
+  [1] asr/speech_recognizer.py (ASR 引擎参数)
+      - beam_size: 1 → 3（束搜索从贪心升级为3候选，显著提升准确率）
+      - repetition_penalty: 1.0 → 1.1（抑制重复幻觉）
+      - no_speech_threshold: 0.4 → 0.35（更宽松的语音检测）
+      - log_prob_threshold: -1.0 → -0.8（略严格过滤低质量段）
+      - VAD min_silence_duration_ms: 600 → 300（更快检测语音边界）
+      - VAD speech_pad_ms: 300 → 400（更多上下文保留）
+
+  [2] gui.py (RecognizeThread 录音控制)
+      - 静音截断超时: 0.7s → 1.2s（多指令间自然停顿不再被误截）
+      - 最大录音时长: 10s → 15s（容纳更长的多指令语句）
+
+  [3] audio/audio_preprocess.py (音频预处理)
+      - process() 新增噪声门控:
+        按帧计算 RMS，低于最大 RMS 5% 的帧静零处理
+        提升送入 Whisper 的信噪比，减少背景噪声干扰
+        使用 frame_shift 精确对齐，避免切片错位

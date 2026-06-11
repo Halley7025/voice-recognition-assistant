@@ -1,4 +1,4 @@
-"""Audio preprocessing with Silero VAD and linear peak normalization.
+﻿"""Audio preprocessing with Silero VAD and linear peak normalization.
 
 Pipeline: Silero VAD -> speech extraction -> peak normalization -> pre-emphasis.
 

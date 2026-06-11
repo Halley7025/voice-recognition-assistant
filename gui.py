@@ -218,7 +218,7 @@ class RecognizeThread(QThread):
                 has_speech = False
                 speech_threshold = self._get_speech_threshold()
 
-                while self.running and (time.time() - start_time) < 10:
+                while self.running and (time.time() - start_time) < 15:
                     data = self.capture.stream.read(
                         self.capture.chunk, exception_on_overflow=False
                     )
@@ -235,7 +235,7 @@ class RecognizeThread(QThread):
                     elif has_speech:
                         if silence_start is None:
                             silence_start = time.time()
-                        elif time.time() - silence_start > 0.7:
+                        elif time.time() - silence_start > 1.2:
                             break
 
                 if not chunks:
