@@ -1,4 +1,4 @@
-"""Modern dark theme - enlarged fonts, proper sizing, Fluent Design."""
+﻿"""Modern dark theme - enlarged fonts, proper sizing, Fluent Design."""
 
 COLORS = {
     "bg_dark": "#0a0a1a",
@@ -26,7 +26,7 @@ DARK_STYLE = """
 QMainWindow, QWidget {
     background-color: transparent;
     color: #e2e8f0;
-    font-size: 14px;
+    font-size: 21px;
 }
 
 /* ========== Buttons ========== */
@@ -36,7 +36,7 @@ QPushButton {
     border: none;
     border-radius: 8px;
     padding: 8px 20px;
-    font-size: 15px;
+    font-size: 22px;
     min-height: 38px;
 }
 QPushButton:hover {
@@ -60,7 +60,7 @@ QLineEdit {
     border-bottom: 2px solid #1e2d4a;
     border-radius: 6px;
     padding: 0 15px;
-    font-size: 14px;
+    font-size: 21px;
     min-height: 40px;
     selection-background-color: #00e5ff;
 }
@@ -77,7 +77,7 @@ QComboBox {
     border-bottom: 2px solid #1e2d4a;
     border-radius: 6px;
     padding: 0 15px;
-    font-size: 14px;
+    font-size: 21px;
     min-height: 40px;
 }
 QComboBox:focus {
@@ -93,7 +93,7 @@ QComboBox QAbstractItemView {
     selection-background-color: #2563eb;
     border: 1px solid #1e2d4a;
     border-radius: 6px;
-    font-size: 14px;
+    font-size: 21px;
     padding: 4px;
 }
 
@@ -104,7 +104,7 @@ QTextEdit {
     border: none;
     border-radius: 8px;
     padding: 12px;
-    font-size: 14px;
+    font-size: 21px;
 }
 
 /* ========== GroupBox (Card sections) ========== */
@@ -114,7 +114,7 @@ QGroupBox {
     border-radius: 12px;
     margin-top: 16px;
     padding: 24px 20px 20px 20px;
-    font-size: 16px;
+    font-size: 24px;
     font-weight: bold;
     color: #8899aa;
 }
@@ -123,7 +123,7 @@ QGroupBox::title {
     left: 20px;
     padding: 0 10px;
     color: #00e5ff;
-    font-size: 16px;
+    font-size: 24px;
     font-weight: bold;
 }
 
@@ -139,7 +139,7 @@ QTabBar::tab {
     color: #8899aa;
     padding: 12px 24px;
     border-bottom: 2px solid transparent;
-    font-size: 14px;
+    font-size: 21px;
 }
 QTabBar::tab:selected {
     color: #00e5ff;
@@ -156,7 +156,7 @@ QProgressBar {
     border-radius: 5px;
     text-align: center;
     color: #e2e8f0;
-    font-size: 12px;
+    font-size: 18px;
     min-height: 12px;
 }
 QProgressBar::chunk {
@@ -181,7 +181,7 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
 
 /* ========== Labels ========== */
 QLabel {
-    font-size: 14px;
+    font-size: 21px;
     color: #e2e8f0;
 }
 """
@@ -190,3 +190,4 @@ QLabel {
 def apply_theme(app):
     """Apply modern dark theme to the application."""
     app.setStyleSheet(DARK_STYLE)
+

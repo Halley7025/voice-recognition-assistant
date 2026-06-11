@@ -421,14 +421,14 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.status_indicator)
 
         title = QLabel("语音识别助手")
-        title.setFont(QFont("Microsoft YaHei", 16, QFont.Bold))
+        title.setFont(QFont("Microsoft YaHei", 24, QFont.Bold))
         title.setStyleSheet(f"color: {COLORS['text_primary']};")
         layout.addWidget(title)
 
         layout.addStretch()
 
         self.user_label = QLabel("未登录")
-        self.user_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 13px;")
+        self.user_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 20px;")
         layout.addWidget(self.user_label)
 
         self.min_btn = QPushButton("—")
@@ -440,7 +440,7 @@ class MainWindow(QMainWindow):
         self.logout_btn = QPushButton("切换用户")
         self.logout_btn.setFixedHeight(28)
         self.logout_btn.setCursor(Qt.PointingHandCursor)
-        self.logout_btn.setFont(QFont("Microsoft YaHei", 10))
+        self.logout_btn.setFont(QFont("Microsoft YaHei", 15))
         self.logout_btn.setStyleSheet(
             "QPushButton{background:transparent; color:" + COLORS["text_secondary"] + "; border:1px solid " + COLORS["text_muted"] + "; border-radius:6px; padding:2px 12px;}"
             "QPushButton:hover{color:" + COLORS["text_primary"] + "; border-color:" + COLORS["accent"] + ";}"
@@ -570,7 +570,7 @@ class MainWindow(QMainWindow):
         log_layout.setSpacing(10)
         self.log_display = QTextEdit()
         self.log_display.setReadOnly(True)
-        self.log_display.setFont(QFont("Consolas", 10))
+        self.log_display.setFont(QFont("Consolas", 15))
         self.log_display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         log_layout.addWidget(self.log_display)
         clear_btn = QPushButton("清空日志")
@@ -584,7 +584,7 @@ class MainWindow(QMainWindow):
         hist_layout.setSpacing(10)
         self.history_display = QTextEdit()
         self.history_display.setReadOnly(True)
-        self.history_display.setFont(QFont("Consolas", 10))
+        self.history_display.setFont(QFont("Consolas", 15))
         self.history_display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         hist_layout.addWidget(self.history_display)
         hist_btn_row = QHBoxLayout()
@@ -616,7 +616,7 @@ class MainWindow(QMainWindow):
         info_group = QGroupBox("系统信息")
         info_layout = QVBoxLayout(info_group)
         self.info_label = QLabel()
-        self.info_label.setFont(QFont("Microsoft YaHei", 10))
+        self.info_label.setFont(QFont("Microsoft YaHei", 15))
         self.info_label.setWordWrap(True)
         self.info_label.setTextFormat(Qt.RichText)
         self._update_info_display()
@@ -649,13 +649,13 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 4, 16, 4)
 
         self.status_text = QLabel("就绪")
-        self.status_text.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px;")
+        self.status_text.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 18px;")
         layout.addWidget(self.status_text)
 
         layout.addStretch()
 
         self.model_info = QLabel()
-        self.model_info.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px;")
+        self.model_info.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 18px;")
         model_name = self.recognizer.model_type or "未加载"
         self.model_info.setText(f"模型: Whisper-{model_name}")
         layout.addWidget(self.model_info)
@@ -854,7 +854,7 @@ class MainWindow(QMainWindow):
         if is_match:
             self.current_user = user_id
             self.user_label.setText(f"  {user_id}")
-            self.user_label.setStyleSheet(f"color: {COLORS['success']}; font-size: 12px;")
+            self.user_label.setStyleSheet(f"color: {COLORS['success']}; font-size: 18px;")
             self._log(f"<span style='color:{COLORS['text_muted']}'>[{timestamp}]</span> "
                       f"<span style='color:{COLORS['success']}'>✓ 验证通过: {user_id} "
                       f"(相似度: {sim:.3f})</span>")
@@ -944,7 +944,7 @@ class MainWindow(QMainWindow):
             if self.current_user == user_id:
                 self.current_user = None
                 self.user_label.setText("  未验证")
-                self.user_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px;")
+                self.user_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 18px;")
             self._refresh_user_list()
         else:
             self._log(f"<span style='color:{COLORS['text_muted']}'>[{timestamp}]</span> "
@@ -967,7 +967,7 @@ from PyQt5.QtWidgets import QStackedWidget
 
 def main():
     app = QApplication(sys.argv)
-    app.setFont(QFont("Microsoft YaHei", 10))
+    app.setFont(QFont("Microsoft YaHei", 15))
     app.setStyle("Fusion")
     apply_theme(app)
 
@@ -992,7 +992,7 @@ def main():
             main_win.current_user = user_id
             main_win.user_label.setText(f"  {user_id}")
             main_win.user_label.setStyleSheet(
-                f"color: {COLORS['success']}; font-size: 12px;"
+                f"color: {COLORS['success']}; font-size: 18px;"
             )
         stack.setCurrentIndex(1)
 
