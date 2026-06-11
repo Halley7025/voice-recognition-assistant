@@ -1959,3 +1959,17 @@ P3 - Whisper 模型升级:
       - enroll_btn (注册新用户):
         宽度 700px → 490px, 高度 180px → 126px
       - 按钮间距保持不变
+
+[2026-06-11] 登录按钮改为固定宽度，防止拉伸撑满窗口
+----------------------------------------
+
+问题描述:
+  按钮使用 setMinimumWidth 导致布局中可能被拉伸至窗口宽度边界，
+  需要改为固定宽度，保持 70% 缩放后不顶到边界。
+
+修改文件及内容:
+
+  [1] gui_login.py
+      - verify_btn: setMinimumWidth(490) → setFixedWidth(490)
+      - enroll_btn: setMinimumWidth(490) → setFixedWidth(490)
+      - 窗口宽度由输入框(800px)决定，按钮保持居中不撑满
