@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import os
 import time
 
@@ -547,6 +547,11 @@ class MainWindow(QMainWindow):
         auth_btn.setCursor(Qt.PointingHandCursor)
         auth_btn.clicked.connect(self._do_auth)
         auth_layout.addWidget(auth_btn)
+
+        delete_btn = QPushButton("删除")
+        delete_btn.setCursor(Qt.PointingHandCursor)
+        delete_btn.clicked.connect(self._do_delete_user)
+        auth_layout.addWidget(delete_btn)
         layout.addWidget(auth_group)
 
         layout.addStretch()
@@ -913,6 +918,40 @@ class MainWindow(QMainWindow):
             self._log(f"  <span style='color:{COLORS['error']}'>✗ 注册失败: {user_id}</span>")
         self.status_text.setText("就绪")
         self._update_info_display()
+
+    def _do_delete_user(self):
+        """删除选中用户的声纹记录"""
+        user_id = self.user_combo.currentText().strip()
+        if not user_id:
+            QMessageBox.warning(self, "提示", "请先选择要删除的用户")
+            return
+        if user_id not in self.verifier.list_users():
+            QMessageBox.warning(self, "提示", f"用户 '{user_id}' 不存在")
+            return
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除用户 '{user_id}' 的声纹记录吗？\n此操作不可撤销。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        success = self.verifier.delete_user(user_id)
+        timestamp = time.strftime("%H:%M:%S")
+        if success:
+            self._log(f"<span style='color:{COLORS['text_muted']}'>[{timestamp}]</span> "
+                      f"<span style='color:{COLORS['warning']}'>✓ 已删除用户: {user_id}</span>")
+            # 如果删除的是当前验证用户，清除当前用户状态
+            if self.current_user == user_id:
+                self.current_user = None
+                self.user_label.setText("  未验证")
+                self.user_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px;")
+            self._refresh_user_list()
+        else:
+            self._log(f"<span style='color:{COLORS['text_muted']}'>[{timestamp}]</span> "
+                      f"<span style='color:{COLORS['error']}'>✗ 删除失败: {user_id}</span>")
+        self.status_text.setText("就绪")
+        self._update_info_display()
+
     def _log(self, html):
         self.log_display.append(html)
 
